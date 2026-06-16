@@ -34,6 +34,7 @@ build_lib(
     model/rdma-driver.cc
     model/rdma-queue-pair.cc
     model/rdma-hw.cc
+    model/event-logger.cc
     model/switch-node.cc
     model/switch-mmu.cc
     model/nvswitch-node.cc
@@ -56,6 +57,7 @@ build_lib(
     model/rdma-driver.h
     model/rdma-queue-pair.h
     model/rdma-hw.h
+    model/event-logger.h
     model/switch-node.h
     model/switch-mmu.h
     model/trace-format.h

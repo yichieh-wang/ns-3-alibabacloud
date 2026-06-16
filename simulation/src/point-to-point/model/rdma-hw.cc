@@ -12,6 +12,7 @@
 #include "ppp-header.h"
 #include "qbb-header.h"
 #include "cn-header.h"
+#include "event-logger.h"
 #ifdef NS3_MTP
 #include "ns3/mtp-interface.h"
 #endif
@@ -316,6 +317,7 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	else qp->nvls_enable = 0;
 	// Notify Nic
 	m_nic[nic_idx].dev->NewQp(qp);
+	EventLogger::Get().OnQpAdded(qp);
 }
 
 void RdmaHw::DeleteQueuePair(Ptr<RdmaQueuePair> qp){
@@ -640,6 +642,10 @@ void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	// It may also delete the rxQp on the receiver
 	m_qpCompleteCallback(qp);
 
+	// Notify the event logger before DeleteQueuePair frees the QP, so the
+	// qp_complete event still sees valid identity/size/startTime fields.
+	EventLogger::Get().OnQpComplete(qp);
+
 	qp->m_notifyAppFinish();
 
 	// delete the qp
@@ -749,6 +755,7 @@ void RdmaHw::ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate){
 
 	// change to new rate
 	qp->m_rate = new_rate;
+	EventLogger::Get().OnRateUpdate(qp, "change_rate");
 }
 /**
  * when nic send a packet, update the bytes it has sent
@@ -841,6 +848,7 @@ void RdmaHw::cnp_received_mlx(Ptr<RdmaQueuePair> q){
 		ScheduleDecreaseRateMlx(q, 1); // add 1 ns to make sure rate decrease is after alpha update
 		// set rate on first CNP
 		q->mlx.m_targetRate = q->m_rate = m_rateOnFirstCNP * q->m_rate;
+		EventLogger::Get().OnRateUpdate(q, "mlx_cnp");
 		q->mlx.m_first_cnp = false;
 	}
 }
@@ -859,6 +867,7 @@ void RdmaHw::CheckRateDecreaseMlx(Ptr<RdmaQueuePair> q){
 		if (clamp)
 			q->mlx.m_targetRate = q->m_rate;
 		q->m_rate = std::max(m_minRate, q->m_rate * (1 - q->mlx.m_alpha / 2));
+		EventLogger::Get().OnRateUpdate(q, "mlx_dec");
 		// reset rate increase related things
 		q->mlx.m_rpTimeStage = 0;
 		q->mlx.m_decrease_cnp_arrived = false;
@@ -894,6 +903,7 @@ void RdmaHw::FastRecoveryMlx(Ptr<RdmaQueuePair> q){
 	printf("%lu fast recovery: %08x %08x %u %u (%0.3lf %.3lf)->", Simulator::Now().GetTimeStep(), q->sip.Get(), q->dip.Get(), q->sport, q->dport, q->mlx.m_targetRate.GetBitRate() * 1e-9, q->m_rate.GetBitRate() * 1e-9);
 	#endif
 	q->m_rate = (q->m_rate / 2) + (q->mlx.m_targetRate / 2);
+	EventLogger::Get().OnRateUpdate(q, "mlx_fastrec");
 	#if PRINT_LOG
 	printf("(%.3lf %.3lf)\n", q->mlx.m_targetRate.GetBitRate() * 1e-9, q->m_rate.GetBitRate() * 1e-9);
 	#endif
@@ -910,6 +920,7 @@ void RdmaHw::ActiveIncreaseMlx(Ptr<RdmaQueuePair> q){
 	if (q->mlx.m_targetRate > dev->GetDataRate())
 		q->mlx.m_targetRate = dev->GetDataRate();
 	q->m_rate = (q->m_rate / 2) + (q->mlx.m_targetRate / 2);
+	EventLogger::Get().OnRateUpdate(q, "mlx_actinc");
 	#if PRINT_LOG
 	printf("(%.3lf %.3lf)\n", q->mlx.m_targetRate.GetBitRate() * 1e-9, q->m_rate.GetBitRate() * 1e-9);
 	#endif
@@ -926,6 +937,7 @@ void RdmaHw::HyperIncreaseMlx(Ptr<RdmaQueuePair> q){
 	if (q->mlx.m_targetRate > dev->GetDataRate())
 		q->mlx.m_targetRate = dev->GetDataRate();
 	q->m_rate = (q->m_rate / 2) + (q->mlx.m_targetRate / 2);
+	EventLogger::Get().OnRateUpdate(q, "mlx_hyperinc");
 	#if PRINT_LOG
 	printf("(%.3lf %.3lf)\n", q->mlx.m_targetRate.GetBitRate() * 1e-9, q->m_rate.GetBitRate() * 1e-9);
 	#endif
@@ -1170,6 +1182,7 @@ void RdmaHw::UpdateRateTimely(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader
 				qp->tmly.rttDiff = rtt_diff;
 			}
 		}
+		EventLogger::Get().OnRateUpdate(qp, "timely");
 		#if PRINT_LOG
 		if (print){
 			printf(" %c %.3lf\n", inc? '^':'v', qp->m_rate.GetBitRate() * 1e-9);
@@ -1230,6 +1243,7 @@ void RdmaHw::HandleAckDctcp(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &
 		printf("%lu %s %08x %08x %u %u %.3lf->", Simulator::Now().GetTimeStep(), "rate", qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport, qp->m_rate.GetBitRate()*1e-9);
 		#endif
 		qp->m_rate = std::max(m_minRate, qp->m_rate * (1 - qp->dctcp.m_alpha / 2));
+		EventLogger::Get().OnRateUpdate(qp, "dctcp_dec");
 		#if PRINT_LOG
 		printf("%.3lf\n", qp->m_rate.GetBitRate() * 1e-9);
 		#endif
@@ -1238,8 +1252,10 @@ void RdmaHw::HandleAckDctcp(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &
 	}
 
 	// additive inc
-	if (qp->dctcp.m_caState == 0 && new_batch)
+	if (qp->dctcp.m_caState == 0 && new_batch){
 		qp->m_rate = std::min(qp->m_max_rate, qp->m_rate + m_dctcp_rai);
+		EventLogger::Get().OnRateUpdate(qp, "dctcp_inc");
+	}
 }
 
 /*********************
