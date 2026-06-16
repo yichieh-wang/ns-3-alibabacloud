@@ -403,6 +403,7 @@ int RdmaHw::SendPacketComplete(Ptr<Packet> p, CustomHeader &ch)
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
 	SendComplete(qp);
+	return 0; // non-void path must return: falling off the end is UB (SIGSEGV at -O2)
 }
 
 void RdmaHw::SendComplete(Ptr<RdmaQueuePair> qp)
