@@ -25,11 +25,22 @@ namespace {
 void EmitFlow(std::ostream& os, const Ptr<RdmaQueuePair>& qp) {
   os << qp->sip << ":" << qp->sport << "->" << qp->dip << ":" << qp->dport;
 }
+// Subnet key = the source IP's /16 prefix. For our 11.<leaf>.<host>.1 scheme this
+// groups flows by leaf (the cache atom). See the m_activeBySubnet comment.
+uint32_t SubnetKey(const Ptr<RdmaQueuePair>& qp) {
+  return qp->sip.Get() & 0xFFFF0000u;
+}
+// Print a /16 subnet key as its first two octets, e.g. "11.2".
+void EmitSubnet(std::ostream& os, uint32_t key) {
+  os << ((key >> 24) & 0xFFu) << "." << ((key >> 16) & 0xFFu);
+}
 } // namespace
 
 void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
   if (!m_enabled) return;
-  m_active.push_back(qp); // the new flow is now active
+  uint32_t sub = SubnetKey(qp);
+  std::vector<Ptr<RdmaQueuePair>>& group = m_activeBySubnet[sub];
+  group.push_back(qp); // the new flow joins its subnet's active set
   int64_t t = Simulator::Now().GetNanoSeconds();
   std::cout << "EVENT qp_add"
             << " t_ns=" << t
@@ -39,9 +50,10 @@ void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
             << " dport=" << qp->dport
             << " size_bytes=" << qp->m_size
             << " pg=" << qp->m_pg
-            << " active_n=" << m_active.size()
-            << std::endl;
-  DumpActiveSet(t);
+            << " subnet=";
+  EmitSubnet(std::cout, sub);
+  std::cout << " active_n=" << group.size() << std::endl;
+  DumpActiveSet(t, sub);
 }
 
 void EventLogger::OnRateUpdate(Ptr<RdmaQueuePair> qp, const char* why) {
@@ -59,10 +71,12 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
   if (!m_enabled) return;
   int64_t t = Simulator::Now().GetNanoSeconds();
   uint64_t fct_ns = (Simulator::Now() - qp->startTime).GetNanoSeconds();
-  // Remove the finishing flow BEFORE the snapshot, so the dumped active set is
-  // the one that governs the next segment (until the next key event).
-  for (auto it = m_active.begin(); it != m_active.end(); ++it) {
-    if (*it == qp) { m_active.erase(it); break; }
+  // Remove the finishing flow from its subnet's set BEFORE the snapshot, so the
+  // dumped set is the one that governs the next segment (until the next key event).
+  uint32_t sub = SubnetKey(qp);
+  std::vector<Ptr<RdmaQueuePair>>& group = m_activeBySubnet[sub];
+  for (auto it = group.begin(); it != group.end(); ++it) {
+    if (*it == qp) { group.erase(it); break; }
   }
   std::cout << "EVENT qp_complete"
             << " t_ns=" << t
@@ -70,16 +84,19 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
   EmitFlow(std::cout, qp);
   std::cout << " fct_ns=" << fct_ns
             << " size_bytes=" << qp->m_size
-            << " active_n=" << m_active.size()
-            << std::endl;
-  DumpActiveSet(t);
+            << " subnet=";
+  EmitSubnet(std::cout, sub);
+  std::cout << " active_n=" << group.size() << std::endl;
+  DumpActiveSet(t, sub);
 }
 
-// One "EVENT active" line per currently-active QP, sorted by 5-tuple so the
-// snapshot order is deterministic + canonical. sent=snd_nxt (bytes put on wire),
-// acked=snd_una (bytes acknowledged), remaining=size-sent.
-void EventLogger::DumpActiveSet(int64_t t_ns) {
-  std::vector<Ptr<RdmaQueuePair>> v = m_active;
+// One "EVENT active" line per active QP IN ONE SUBNET (the affected one), sorted by
+// 5-tuple so the snapshot order is deterministic + canonical. sent=snd_nxt (bytes put
+// on wire), acked=snd_una (bytes acknowledged), remaining=size-sent.
+void EventLogger::DumpActiveSet(int64_t t_ns, uint32_t subnetKey) {
+  auto it = m_activeBySubnet.find(subnetKey);
+  if (it == m_activeBySubnet.end()) return;
+  std::vector<Ptr<RdmaQueuePair>> v = it->second;
   std::sort(v.begin(), v.end(),
             [](const Ptr<RdmaQueuePair>& a, const Ptr<RdmaQueuePair>& b) {
     if (a->sip.Get() != b->sip.Get()) return a->sip.Get() < b->sip.Get();
@@ -91,7 +108,9 @@ void EventLogger::DumpActiveSet(int64_t t_ns) {
     uint64_t remaining = (qp->m_size > qp->snd_nxt) ? (qp->m_size - qp->snd_nxt) : 0;
     std::cout << "EVENT active"
               << " t_ns=" << t_ns
-              << " flow=";
+              << " subnet=";
+    EmitSubnet(std::cout, subnetKey);
+    std::cout << " flow=";
     EmitFlow(std::cout, qp);
     std::cout << " sent_bytes=" << qp->snd_nxt
               << " acked_bytes=" << qp->snd_una

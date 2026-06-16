@@ -3,6 +3,7 @@
 #include <ns3/rdma-queue-pair.h>
 #include <ns3/ptr.h>
 #include <cstdint>
+#include <map>
 #include <vector>
 
 namespace ns3 {
@@ -42,14 +43,16 @@ public:
 private:
   EventLogger();
   bool m_enabled = false;
-  // Flows (QPs) currently active, maintained by OnQpAdded / OnQpComplete. A "key
-  // event" (a flow starting or finishing) changes this set; after each change we
-  // dump a snapshot -- the cache wants, at every active-set change, WHO is
-  // contending + each flow's progress + rate.
-  std::vector<Ptr<RdmaQueuePair>> m_active;
-  // Emit one "EVENT active ..." line per currently-active QP, sorted by 5-tuple
-  // (deterministic order), carrying sent/acked/remaining bytes + current rate.
-  void DumpActiveSet(int64_t t_ns);
+  // Active flows (QPs) grouped BY SUBNET, maintained by OnQpAdded / OnQpComplete.
+  // The cache keys on a SUBNET's active set, not a global one (cache-design §7.5),
+  // so we partition. Subnet key = the source IP's /16 prefix (our 11.<leaf>.<host>.1
+  // scheme groups by leaf). This is an IP-prefix PROXY: exact for intra-subnet flows
+  // whose IP scheme encodes the subnet (our fabric does); transit/inter-subnet flows
+  // and topology-aware grouping are a consumer concern (need switch-side hooks).
+  std::map<uint32_t, std::vector<Ptr<RdmaQueuePair>>> m_activeBySubnet;
+  // Emit one "EVENT active ..." line per active QP in ONE subnet (the affected one),
+  // sorted by 5-tuple, carrying sent/acked/remaining bytes + current rate.
+  void DumpActiveSet(int64_t t_ns, uint32_t subnetKey);
 };
 
 } // namespace ns3
