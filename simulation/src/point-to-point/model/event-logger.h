@@ -2,6 +2,8 @@
 #define EVENT_LOGGER_H
 #include <ns3/rdma-queue-pair.h>
 #include <ns3/ptr.h>
+#include <cstdint>
+#include <vector>
 
 namespace ns3 {
 
@@ -16,9 +18,14 @@ namespace ns3 {
 //
 // When enabled, each hook emits one line to std::cout in the house key=value
 // style, e.g.:
-//   EVENT qp_add t_ns=... sip=... sport=... dip=... dport=... size_bytes=... pg=...
+//   EVENT qp_add t_ns=... sip=... ... pg=... active_n=<#active flows now>
 //   EVENT rate_update t_ns=... flow=10.0.0.1:10000->10.0.0.2:100 rate_gbps=...
-//   EVENT qp_complete t_ns=... flow=... fct_ns=... size_bytes=...
+//   EVENT qp_complete t_ns=... flow=... fct_ns=... size_bytes=... active_n=...
+// A "key event" (qp_add / qp_complete) CHANGES the set of active flows; right
+// after each one, one "EVENT active" line per still-active flow is emitted
+// (sorted by 5-tuple) carrying its progress + rate -- the snapshot the cache
+// keys on:
+//   EVENT active t_ns=... flow=... sent_bytes=... acked_bytes=... remaining_bytes=... rate_gbps=...
 class EventLogger {
 public:
   static EventLogger& Get();
@@ -35,6 +42,14 @@ public:
 private:
   EventLogger();
   bool m_enabled = false;
+  // Flows (QPs) currently active, maintained by OnQpAdded / OnQpComplete. A "key
+  // event" (a flow starting or finishing) changes this set; after each change we
+  // dump a snapshot -- the cache wants, at every active-set change, WHO is
+  // contending + each flow's progress + rate.
+  std::vector<Ptr<RdmaQueuePair>> m_active;
+  // Emit one "EVENT active ..." line per currently-active QP, sorted by 5-tuple
+  // (deterministic order), carrying sent/acked/remaining bytes + current rate.
+  void DumpActiveSet(int64_t t_ns);
 };
 
 } // namespace ns3
