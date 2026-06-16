@@ -1,5 +1,6 @@
 #include "event-logger.h"
 #include <ns3/simulator.h>
+#include <ns3/ipv4-address.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -17,6 +18,27 @@ EventLogger& EventLogger::Get() {
 EventLogger::EventLogger() {
   const char* v = std::getenv("NS3_EVENTS");
   m_enabled = (v != nullptr && std::strlen(v) > 0);
+}
+
+// Runs at program exit (after Simulator::Destroy), so it is the right place to
+// flush the per-(switch,port,flow) traversal summary. One "EVENT switch_flow"
+// line per key; the map is ordered so output is deterministic. No-op when off
+// (the map is never populated when disabled).
+EventLogger::~EventLogger() {
+  if (!m_enabled) return;
+  for (const auto& kv : m_switchFlows) {
+    const SwitchFlowKey& k = kv.first;
+    const SwitchFlowStat& s = kv.second;
+    std::cout << "EVENT switch_flow"
+              << " switch=" << k.switch_id
+              << " port=" << k.out_port
+              << " flow=" << Ipv4Address(k.src_ip) << ":" << k.sport
+              << "->" << Ipv4Address(k.dst_ip) << ":" << k.dport
+              << " first_ns=" << s.first_ns
+              << " last_ns=" << s.last_ns
+              << " bytes=" << s.bytes
+              << std::endl;
+  }
 }
 
 namespace {
@@ -88,6 +110,34 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
   EmitSubnet(std::cout, sub);
   std::cout << " active_n=" << group.size() << std::endl;
   DumpActiveSet(t, sub);
+}
+
+// SWITCH-SIDE traversal hook. Called per data packet from SwitchNode::SendToDev,
+// but only EMITS on the FIRST sighting of a (switch, port, 5-tuple) key -- this is
+// the RAW "flow entered this switch via this egress port" event. Per-key timing
+// (first_ns/last_ns) + byte counts accumulate silently and flush at destruction.
+void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t out_port,
+                                  uint64_t bytes, uint32_t src_ip, uint32_t dst_ip,
+                                  uint16_t sport, uint16_t dport) {
+  if (!m_enabled) return;
+  int64_t t = Simulator::Now().GetNanoSeconds();
+  SwitchFlowKey key{switch_id, out_port, src_ip, dst_ip, sport, dport};
+  auto it = m_switchFlows.find(key);
+  if (it == m_switchFlows.end()) {
+    // First time this flow is seen at this switch+port: emit the enter event.
+    m_switchFlows.emplace(key, SwitchFlowStat{t, t, bytes});
+    std::cout << "EVENT switch_enter"
+              << " t_ns=" << t
+              << " switch=" << switch_id
+              << " port=" << out_port
+              << " flow=" << Ipv4Address(src_ip) << ":" << sport
+              << "->" << Ipv4Address(dst_ip) << ":" << dport
+              << std::endl;
+  } else {
+    // Already seen: just fold in this packet's timing + bytes (no per-packet line).
+    it->second.last_ns = t;
+    it->second.bytes += bytes;
+  }
 }
 
 // One "EVENT active" line per active QP IN ONE SUBNET (the affected one), sorted by

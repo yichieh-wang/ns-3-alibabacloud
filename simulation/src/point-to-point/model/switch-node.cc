@@ -11,6 +11,7 @@
 #include "ppp-header.h"
 #include "ns3/int-header.h"
 #include "ns3/simulator.h"
+#include "event-logger.h"
 #include <cmath>
 
 namespace ns3 {
@@ -108,6 +109,12 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 	int idx = GetOutDev(p, ch);
 	if (idx >= 0){
 		NS_ASSERT_MSG(m_devices[idx]->IsLinkUp(), "The routing table look up should return link that is up");
+
+		// SWITCH-SIDE flow instrumentation (observe-only; no-op unless NS3_EVENTS set).
+		// Report this DATA flow's traversal at (this switch, egress port idx) so post-
+		// processing can reconstruct transit paths + reroute bubbles. Data packets only.
+		if (ch.l3Prot == 0x11)
+			EventLogger::Get().OnSwitchForward(GetId(), (uint32_t)idx, p->GetSize(), ch.sip, ch.dip, ch.udp.sport, ch.udp.dport);
 
 		// determine the qIndex
 		uint32_t qIndex;

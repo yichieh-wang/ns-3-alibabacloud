@@ -40,8 +40,23 @@ public:
   void OnRateUpdate(Ptr<RdmaQueuePair> qp, const char* why);
   void OnQpComplete(Ptr<RdmaQueuePair> qp);
 
+  // SWITCH-SIDE hook (design point (d)): called from SwitchNode::SendToDev once a
+  // valid egress device index is known, for DATA packets only. Reports a flow's
+  // RAW traversal per (switch, egress port) so post-processing can reason about
+  // transit flows + reroute bubbles -- something the host-side hooks (which only
+  // see the QP at its endpoints) cannot. Primitives only (no CustomHeader) so the
+  // logger needs no extra ns-3 coupling; src/dst IPs are raw uint32 IPv4 and are
+  // formatted via Ipv4Address(...) to the dotted-quad flow-id style.
+  // First sighting of a (switch,port,5-tuple) key emits one "EVENT switch_enter";
+  // per-key first_ns/last_ns/bytes accumulate and flush as "EVENT switch_flow" at
+  // logger destruction (program exit). Never per-packet spam.
+  void OnSwitchForward(uint32_t switch_id, uint32_t out_port, uint64_t bytes,
+                       uint32_t src_ip, uint32_t dst_ip,
+                       uint16_t sport, uint16_t dport);
+
 private:
   EventLogger();
+  ~EventLogger();
   bool m_enabled = false;
   // Active flows (QPs) grouped BY SUBNET, maintained by OnQpAdded / OnQpComplete.
   // The cache keys on a SUBNET's active set, not a global one (cache-design §7.5),
@@ -53,6 +68,32 @@ private:
   // Emit one "EVENT active ..." line per active QP in ONE subnet (the affected one),
   // sorted by 5-tuple, carrying sent/acked/remaining bytes + current rate.
   void DumpActiveSet(int64_t t_ns, uint32_t subnetKey);
+
+  // Per (switch, egress port, 5-tuple) traversal state for OnSwitchForward. Key is
+  // ordered (switch, port, src_ip, dst_ip, sport, dport) so the destructor flush is
+  // deterministic. first_ns set on first sight, last_ns updated each call, bytes summed.
+  struct SwitchFlowKey {
+    uint32_t switch_id;
+    uint32_t out_port;
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t sport;
+    uint16_t dport;
+    bool operator<(const SwitchFlowKey& o) const {
+      if (switch_id != o.switch_id) return switch_id < o.switch_id;
+      if (out_port  != o.out_port)  return out_port  < o.out_port;
+      if (src_ip    != o.src_ip)    return src_ip    < o.src_ip;
+      if (dst_ip    != o.dst_ip)    return dst_ip    < o.dst_ip;
+      if (sport     != o.sport)     return sport     < o.sport;
+      return dport < o.dport;
+    }
+  };
+  struct SwitchFlowStat {
+    int64_t  first_ns;
+    int64_t  last_ns;
+    uint64_t bytes;
+  };
+  std::map<SwitchFlowKey, SwitchFlowStat> m_switchFlows;
 };
 
 } // namespace ns3
