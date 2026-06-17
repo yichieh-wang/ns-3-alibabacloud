@@ -140,6 +140,16 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t out_port,
   }
 }
 
+// TOPOLOGY hook: a switch declares its structural signature so the cache can map
+// node id -> signature from the stream instead of hardcoding it. Once per switch at setup.
+void EventLogger::OnSwitchInfo(uint32_t switch_id, const std::string& sig) {
+  if (!m_enabled) return;
+  std::cout << "EVENT switch_info"
+            << " switch=" << switch_id
+            << " sig=" << sig
+            << std::endl;
+}
+
 // One "EVENT active" line per active QP IN ONE SUBNET (the affected one), sorted by
 // 5-tuple so the snapshot order is deterministic + canonical. sent=snd_nxt (bytes put
 // on wire), acked=snd_una (bytes acknowledged), remaining=size-sent.

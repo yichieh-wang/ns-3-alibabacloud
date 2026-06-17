@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <vector>
+#include <string>
 
 namespace ns3 {
 
@@ -53,6 +54,12 @@ public:
   void OnSwitchForward(uint32_t switch_id, uint32_t out_port, uint64_t bytes,
                        uint32_t src_ip, uint32_t dst_ip,
                        uint16_t sport, uint16_t dport);
+
+  // TOPOLOGY hook: a switch DECLARES its structural signature (e.g. "leaf"/"spine") into
+  // the event stream as one "EVENT switch_info switch=<id> sig=<sig>", so the cache can map
+  // node id -> signature FROM THE STREAM rather than hardcoding it. Emit once per switch at
+  // setup. Gated like every other event.
+  void OnSwitchInfo(uint32_t switch_id, const std::string& sig);
 
 private:
   EventLogger();
