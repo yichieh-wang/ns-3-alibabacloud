@@ -39,6 +39,7 @@
 #include "ns3/qbb-channel.h"
 #include "ns3/random-variable.h"
 #include "ns3/flow-id-tag.h"
+#include "event-logger.h"
 #include "ns3/qbb-header.h"
 #include "ns3/error-model.h"
 #include "ns3/cn-header.h"
@@ -457,6 +458,7 @@ namespace ns3 {
 	{
 		NS_LOG_FUNCTION(this << qIndex);
 		NS_ASSERT_MSG(m_paused[qIndex], "Must be PAUSEd");
+		EventLogger::Get().OnPfc(m_node->GetId(), m_ifIndex, qIndex, false); // resume: true->false transition
 		m_paused[qIndex] = false;
 		NS_LOG_INFO("Node " << m_node->GetId() << " dev " << m_ifIndex << " queue " << qIndex <<
 			" resumed at " << Simulator::Now().GetSeconds());
@@ -493,6 +495,8 @@ namespace ns3 {
 			unsigned qIndex = ch.pfc.qIndex;
 			if (ch.pfc.time > 0){
 				m_tracePfc(1);
+				if (!m_paused[qIndex]) // log only the false->true transition, not refresh frames
+					EventLogger::Get().OnPfc(m_node->GetId(), m_ifIndex, qIndex, true);
 				m_paused[qIndex] = true;
 			}else{
 				m_tracePfc(0);
@@ -540,7 +544,10 @@ namespace ns3 {
 		p->AddHeader(pauseh);
 		Ipv4Header ipv4h;  // Prepare IPv4 header
 		ipv4h.SetProtocol(0xFE);
-		ipv4h.SetSource(m_node->GetObject<Ipv4>()->GetAddress(m_ifIndex, 0).GetLocal());
+		// A SwitchNode has no aggregated Ipv4; the PFC pause-frame source IP is cosmetic
+		// (PFC is L2), so fall back to 0.0.0.0 rather than dereferencing a null Ipv4 (crash).
+		Ptr<Ipv4> ipv4 = m_node->GetObject<Ipv4>();
+		ipv4h.SetSource(ipv4 ? ipv4->GetAddress(m_ifIndex, 0).GetLocal() : Ipv4Address("0.0.0.0"));
 		ipv4h.SetDestination(Ipv4Address("255.255.255.255"));
 		ipv4h.SetPayloadSize(p->GetSize());
 		ipv4h.SetTtl(1);

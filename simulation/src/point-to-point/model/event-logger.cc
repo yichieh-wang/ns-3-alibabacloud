@@ -150,6 +150,20 @@ void EventLogger::OnSwitchInfo(uint32_t switch_id, const std::string& sig) {
             << std::endl;
 }
 
+// PFC hook: one line per pause/resume STATE TRANSITION on a (node, port, queue), emitted
+// immediately (transitions are low-frequency thanks to the call-site guard). A paused
+// interval is the [paused=1 ... paused=0] pair for that (node, port, q).
+void EventLogger::OnPfc(uint32_t node_id, uint32_t port, uint32_t q_index, bool paused) {
+  if (!m_enabled) return;
+  std::cout << "EVENT pfc"
+            << " t_ns=" << Simulator::Now().GetNanoSeconds()
+            << " node=" << node_id
+            << " port=" << port
+            << " q=" << q_index
+            << " paused=" << (paused ? 1 : 0)
+            << std::endl;
+}
+
 // One "EVENT active" line per active QP IN ONE SUBNET (the affected one), sorted by
 // 5-tuple so the snapshot order is deterministic + canonical. sent=snd_nxt (bytes put
 // on wire), acked=snd_una (bytes acknowledged), remaining=size-sent.

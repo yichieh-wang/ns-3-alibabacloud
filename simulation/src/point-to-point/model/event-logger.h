@@ -61,6 +61,15 @@ public:
   // setup. Gated like every other event.
   void OnSwitchInfo(uint32_t switch_id, const std::string& sig);
 
+  // PFC hook: a QbbNetDevice's TX on (port, queue) PAUSES (it received a PFC PAUSE frame)
+  // or RESUMES. Emitted ONLY on a real state TRANSITION -- no spam on the periodic
+  // PAUSE-refresh frames -- as one
+  //   EVENT pfc t_ns=<now> node=<id> port=<ifIndex> q=<qIndex> paused=<0|1>
+  // per transition. PFC is the dominant flow-control mechanism in the PFC-bound regime
+  // (cache-design §2.4), so these paused intervals ARE the forwarder's boundary
+  // flow-control state. Gated like every other event; off => no-op => byte-identical.
+  void OnPfc(uint32_t node_id, uint32_t port, uint32_t q_index, bool paused);
+
 private:
   EventLogger();
   ~EventLogger();
