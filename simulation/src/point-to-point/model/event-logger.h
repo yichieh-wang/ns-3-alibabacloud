@@ -85,6 +85,18 @@ private:
   // sorted by 5-tuple, carrying sent/acked/remaining bytes + current rate.
   void DumpActiveSet(int64_t t_ns, uint32_t subnetKey);
 
+  // Emit one "EVENT queue ..." line per (switch, egress port, priority-group) that has a NON-ZERO
+  // egress backlog (an absent one == 0), for every SwitchNode (no subnet filter) -- the in-fabric /
+  // queue half of a mid-flight state. The Rust decoder/example picks the ports that matter. Called at
+  // each completion, and (only when NS3_QUEUE_PROBE is set) by the recurring mid-flight probe below.
+  void DumpAllQueues(int64_t t_ns);
+
+  // Recurring mid-flight queue sample (every 5us from the first qp_add, stops when no flow is
+  // active) -- the egress backlog only exists BETWEEN events, so completion-only sampling reads ~0.
+  void PeriodicQueueDump();
+  bool m_queueProbe = false;        // opt-in gate (NS3_QUEUE_PROBE): the 5us probe is heavy, off by default
+  bool m_queueProbeStarted = false; // latched while a burst's probe loop is live; reset when it goes idle
+
   // Per (switch, egress port, 5-tuple) traversal state for OnSwitchForward. Key is
   // ordered (switch, port, src_ip, dst_ip, sport, dport) so the destructor flush is
   // deterministic. first_ns set on first sight, last_ns updated each call, bytes summed.

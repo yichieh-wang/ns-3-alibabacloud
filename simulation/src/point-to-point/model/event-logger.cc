@@ -1,5 +1,7 @@
 #include "event-logger.h"
+#include "switch-node.h"
 #include <ns3/simulator.h>
+#include <ns3/node-list.h>
 #include <ns3/ipv4-address.h>
 #include <algorithm>
 #include <cstdint>
@@ -18,6 +20,8 @@ EventLogger& EventLogger::Get() {
 EventLogger::EventLogger() {
   const char* v = std::getenv("NS3_EVENTS");
   m_enabled = (v != nullptr && std::strlen(v) > 0);
+  const char* q = std::getenv("NS3_QUEUE_PROBE");
+  m_queueProbe = (q != nullptr && std::strlen(q) > 0);
 }
 
 // Runs at program exit (after Simulator::Destroy), so it is the right place to
@@ -76,6 +80,10 @@ void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
   EmitSubnet(std::cout, sub);
   std::cout << " active_n=" << group.size() << std::endl;
   DumpActiveSet(t, sub);
+  if (m_queueProbe && !m_queueProbeStarted) { // opt-in (NS3_QUEUE_PROBE): start the mid-flight queue sample
+    m_queueProbeStarted = true;
+    Simulator::Schedule(NanoSeconds(0), &EventLogger::PeriodicQueueDump, this);
+  }
 }
 
 void EventLogger::OnRateUpdate(Ptr<RdmaQueuePair> qp, const char* why) {
@@ -110,6 +118,7 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
   EmitSubnet(std::cout, sub);
   std::cout << " active_n=" << group.size() << std::endl;
   DumpActiveSet(t, sub);
+  DumpAllQueues(t); // the in-fabric / queue half of the post-completion (next) state
 }
 
 // SWITCH-SIDE traversal hook. Called per data packet from SwitchNode::SendToDev,
@@ -192,6 +201,53 @@ void EventLogger::DumpActiveSet(int64_t t_ns, uint32_t subnetKey) {
               << " rate_gbps=" << (qp->m_rate.GetBitRate() * 1e-9)
               << std::endl;
   }
+}
+
+// One "EVENT queue ..." line per (switch, egress port, priority-group) carrying the REAL egress
+// backlog -- the QbbNetDevice's BEgressQueue (dev->GetQueue()->GetNBytes(pg)), the same queue HPCC
+// reads for its qlen (the BEgressQueue's per-pg occupancy, not SwitchMmu::egress_bytes; both exclude
+// the currently-transmitting packet). Every SwitchNode (NVSwitch GPU domains are a separate node type
+// and not covered), no subnet filter; only (port, pg) with a NON-ZERO backlog is emitted (an absent
+// one == 0). Fired at each completion so it pairs with that instant's active snapshot.
+void EventLogger::DumpAllQueues(int64_t t_ns) {
+  for (auto it = NodeList::Begin(); it != NodeList::End(); ++it) {
+    Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(*it);
+    if (!sw) continue;
+    uint32_t nDev = sw->GetNDevices();
+    for (uint32_t port = 0; port < nDev; ++port) { // start at 0: a SwitchNode has no loopback, so
+      Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(sw->GetDevice(port)); // device 0 is a real
+      if (!dev) continue;                          // egress port (the incast bottleneck is here);
+                                                   // a non-Qbb device (e.g. host loopback) casts to null and is skipped.
+      if (!dev->GetQueue()) continue;              // a Qbb device may exist before its egress queue is wired
+      for (uint32_t pg = 0; pg < 8; ++pg) {        // 8 priority groups
+        uint32_t qbytes = dev->GetQueue()->GetNBytes(pg);
+        if (qbytes == 0) continue;                 // emit only a real backlog; absent == 0, so this
+                                                   // keeps lean (rate-paced) traces and their goldens noise-free.
+        std::cout << "EVENT queue"
+                  << " t_ns=" << t_ns
+                  << " switch=" << sw->GetId()
+                  << " port=" << port
+                  << " pg=" << pg
+                  << " bytes=" << qbytes
+                  << std::endl;
+      }
+    }
+  }
+}
+
+// Recurring mid-flight queue sample. BOUNDED: stops rescheduling once no subnet has an active flow,
+// so it can't keep the simulator alive past the workload (an unbounded reschedule ran the sim to its
+// 10 s stop and emitted ~100M lines). The egress backlog is transient between events, so this is
+// where a non-zero queue shows up -- completion-only sampling reads ~0.
+void EventLogger::PeriodicQueueDump() {
+  if (!m_enabled) return;
+  bool anyActive = false;
+  for (const auto& kv : m_activeBySubnet) {
+    if (!kv.second.empty()) { anyActive = true; break; }
+  }
+  if (!anyActive) { m_queueProbeStarted = false; return; } // idle -> stop, and re-arm for a later burst
+  DumpAllQueues(Simulator::Now().GetNanoSeconds());
+  Simulator::Schedule(NanoSeconds(5000), &EventLogger::PeriodicQueueDump, this);
 }
 
 } // namespace ns3
