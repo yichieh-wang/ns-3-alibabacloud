@@ -70,6 +70,15 @@ public:
   // flow-control state. Gated like every other event; off => no-op => byte-identical.
   void OnPfc(uint32_t node_id, uint32_t port, uint32_t q_index, bool paused);
 
+  // DROP hook: a switch MMU dropped a packet because the ingress headroom for (port, queue) is
+  // full -- i.e. PFC FAILED to be lossless. One
+  //   EVENT drop t_ns=<now> node=<id> port=<port> pg=<qIndex> bytes=<psize>
+  // per dropped packet. In a correctly-provisioned lossless fabric this NEVER fires (drop count == 0);
+  // a non-zero count means PFC could not pause in time -- a bug or an under-provisioned config (too
+  // little headroom / buffer), NOT a normal regime. So it is an ALARM signal, distinct from the cache
+  // guardrail (which skips the congested-but-lossless regime). Gated like every other event.
+  void OnDrop(uint32_t node_id, uint32_t port, uint32_t q_index, uint32_t bytes);
+
 private:
   EventLogger();
   ~EventLogger();

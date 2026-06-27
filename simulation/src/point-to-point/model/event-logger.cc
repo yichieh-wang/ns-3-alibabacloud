@@ -173,6 +173,19 @@ void EventLogger::OnPfc(uint32_t node_id, uint32_t port, uint32_t q_index, bool 
             << std::endl;
 }
 
+// One "EVENT drop ..." line per packet the switch MMU drops on a full ingress headroom (PFC failed
+// to be lossless). Structured replacement for the old debug printf. Should be ZERO in a sound run.
+void EventLogger::OnDrop(uint32_t node_id, uint32_t port, uint32_t q_index, uint32_t bytes) {
+  if (!m_enabled) return;
+  std::cout << "EVENT drop"
+            << " t_ns=" << Simulator::Now().GetNanoSeconds()
+            << " node=" << node_id
+            << " port=" << port
+            << " pg=" << q_index
+            << " bytes=" << bytes
+            << std::endl;
+}
+
 // One "EVENT active" line per active QP IN ONE SUBNET (the affected one), sorted by
 // 5-tuple so the snapshot order is deterministic + canonical. sent=snd_nxt (bytes put
 // on wire), acked=snd_una (bytes acknowledged), remaining=size-sent.

@@ -33,6 +33,7 @@ NVSwitchNode::NVSwitchNode(){
 	m_ecmpSeed = m_id;
 	m_node_type = 2;
 	m_mmu = CreateObject<SwitchMmu>();
+	m_mmu->node_id = GetId(); // same as SwitchNode: so EVENT drop reports the right node
 	for (uint32_t i = 0; i < pCnt; i++)
 		for (uint32_t j = 0; j < pCnt; j++)
 			for (uint32_t k = 0; k < qCnt; k++)

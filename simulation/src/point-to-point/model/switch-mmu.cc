@@ -11,6 +11,7 @@
 #include "ns3/simulator.h"
 #include "ns3/random-variable.h"
 #include "switch-mmu.h"
+#include "event-logger.h"
 
 NS_LOG_COMPONENT_DEFINE("SwitchMmu");
 namespace ns3 {
@@ -28,6 +29,9 @@ namespace ns3 {
 
 		// headroom
 		shared_used_bytes = 0;
+		total_hdrm = 0;
+		total_rsrv = 0;
+		memset(headroom, 0, sizeof(headroom));
 		memset(hdrm_bytes, 0, sizeof(hdrm_bytes));
 		memset(ingress_bytes, 0, sizeof(ingress_bytes));
 		memset(paused, 0, sizeof(paused));
@@ -35,10 +39,7 @@ namespace ns3 {
 	}
 	bool SwitchMmu::CheckIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
 		if (psize + hdrm_bytes[port][qIndex] > headroom[port] && psize + GetSharedUsed(port, qIndex) > GetPfcThreshold(port)){
-			printf("%lu %u Drop: queue:%u,%u: Headroom full\n", Simulator::Now().GetTimeStep(), node_id, port, qIndex);
-			for (uint32_t i = 1; i < 64; i++)
-				printf("(%u,%u)", hdrm_bytes[i][3], ingress_bytes[i][3]);
-			printf("\n");
+			EventLogger::Get().OnDrop(node_id, port, qIndex, psize); // PFC failed to be lossless (headroom full)
 			return false;
 		}
 		return true;
@@ -114,15 +115,13 @@ namespace ns3 {
 		pmax[port] = _pmax;
 	}
 	void SwitchMmu::ConfigHdrm(uint32_t port, uint32_t size){
+		total_hdrm += size - headroom[port]; // maintain the total incrementally -> order- and index-independent
 		headroom[port] = size;
 	}
 	void SwitchMmu::ConfigNPort(uint32_t n_port){
-		total_hdrm = 0;
-		total_rsrv = 0;
-		for (uint32_t i = 1; i <= n_port; i++){
-			total_hdrm += headroom[i];
-			total_rsrv += reserve;
-		}
+		// total_hdrm is now maintained incrementally by ConfigHdrm (the old loop summed headroom[1..=n]
+		// BEFORE ConfigHdrm set it, over the wrong index range -> garbage threshold). Here: reserve total.
+		total_rsrv = n_port * reserve;
 	}
 	void SwitchMmu::ConfigBufferSize(uint32_t size){
 		buffer_size = size;
