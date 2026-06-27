@@ -462,9 +462,18 @@ namespace ns3 {
 		m_paused[qIndex] = false;
 		NS_LOG_INFO("Node " << m_node->GetId() << " dev " << m_ifIndex << " queue " << qIndex <<
 			" resumed at " << Simulator::Now().GetSeconds());
-		Ptr<RdmaQueuePair> lastQp = m_rdmaEQ->GetQp(qIndex);
-		if(lastQp->nvls_enable == 1 && m_node->GetNodeType() == 2) SwitchAsHostSend(); 
-		else DequeueAndTransmit();
+		// NVLS (SwitchAsHostSend) applies only to NVSwitch nodes (NodeType 2). Gate on the node type
+		// FIRST so non-NVSwitch nodes skip the lookup entirely: GetQp(qIndex) indexes the QP group with
+		// a PRIORITY-GROUP index, out of range when the node has fewer QPs. (That OOB read is now
+		// bounds-checked in RdmaQueuePairGroup::Get -> null; before, it was UB and the deref
+		// lastQp->nvls_enable crashed (SIGSEGV) on every PFC resume.)
+		if (m_node->GetNodeType() == 2) {
+			Ptr<RdmaQueuePair> lastQp = m_rdmaEQ ? m_rdmaEQ->GetQp(qIndex) : nullptr;
+			if (lastQp && lastQp->nvls_enable == 1) SwitchAsHostSend();
+			else DequeueAndTransmit();
+		} else {
+			DequeueAndTransmit();
+		}
 	}
 
 	void

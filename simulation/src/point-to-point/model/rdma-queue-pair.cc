@@ -250,6 +250,7 @@ uint32_t RdmaQueuePairGroup::GetN(void){
 }
 
 Ptr<RdmaQueuePair> RdmaQueuePairGroup::Get(uint32_t idx){
+	if (idx >= m_qps.size()) return nullptr; // out-of-range -> null instead of UB; callers either null-check (Resume) or pass bounded indices
 	return m_qps[idx];
 }
 
