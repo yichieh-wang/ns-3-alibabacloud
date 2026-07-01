@@ -12,7 +12,9 @@ namespace ns3 {
 // Lightweight per-event dump observed by rdma-hw via cheap notify hooks. This is
 // design-neutral instrumentation: it only OBSERVES the running RDMA leaf and
 // prints one structured line per event so we can see what events constitute a
-// leaf subnet's behavior. It does NOT change the simulation.
+// leaf subnet's behavior. It does NOT change the simulation -- with ONE deliberate
+// exception, the no-progress stall watchdog (see StallCheck), which Stops a wedged
+// run early; a healthy run never trips it, so its trace stays byte-identical.
 //
 // Gated by the NS3_EVENTS environment variable (read once on first Get()):
 // when it is unset or empty every hook is a no-op, so a default run is
@@ -79,6 +81,15 @@ public:
   // guardrail (which skips the congested-but-lossless regime). Gated like every other event.
   void OnDrop(uint32_t node_id, uint32_t port, uint32_t q_index, uint32_t bytes);
 
+  // INTERACTIVE-mode accessor: on a harness QUERY, serialise the CURRENT state -- one "EVENT active" per
+  // active QP (all subnets) + one "EVENT queue" per non-zero egress backlog -- at Simulator::Now(). Same
+  // key=value format the streaming hooks use, so the Rust decoder reads it unchanged. Used by control.h.
+  void DumpState();
+
+  // Number of currently-active flows (QPs) across all subnets -- control.h uses it to tell a PAUSED
+  // RUN_UNTIL (active > 0, the workload continues) from an ENDED one (active == 0, the workload drained).
+  uint32_t ActiveFlowCount() const;
+
 private:
   EventLogger();
   ~EventLogger();
@@ -105,6 +116,19 @@ private:
   void PeriodicQueueDump();
   bool m_queueProbe = false;        // opt-in gate (NS3_QUEUE_PROBE): the 5us probe is heavy, off by default
   bool m_queueProbeStarted = false; // latched while a burst's probe loop is live; reset when it goes idle
+
+  // No-progress STALL watchdog -- the ONE hook that INTERVENES. "Progress" = total acked bytes
+  // (completed flows' sizes + active flows' snd_una); it advances continuously in a healthy run (ACKs)
+  // and jumps at completions. If it does not advance for m_stallWindowNs of SIM-time, the run is wedged
+  // (a congestion deadlock / drop-storm stall): Simulator::Stop() ends it early + emits "EVENT stall",
+  // so the Rust decoder taints it (Incomplete) instead of burning to the program's 10 s Simulator::Stop.
+  // Gated by NS3_STALL_MS (sim-time ms; 0 disables) AND m_enabled, so vanilla ns-3 stays untouched.
+  void StallCheck();
+  uint64_t m_completedBytes = 0;   // sum of completed flows' sizes (the monotonic part of "progress")
+  uint64_t m_lastProgress = 0;     // last observed total acked (completed + active snd_una)
+  int64_t  m_lastProgressNs = 0;   // sim-time of the last progress advance
+  int64_t  m_stallWindowNs = 0;    // no-progress window before declaring a stall (NS3_STALL_MS; 0 = off)
+  bool     m_stallStarted = false; // arm the watchdog once, on the first qp_add
 
   // Per (switch, egress port, 5-tuple) traversal state for OnSwitchForward. Key is
   // ordered (switch, port, src_ip, dst_ip, sport, dport) so the destructor flush is

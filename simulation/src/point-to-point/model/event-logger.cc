@@ -22,6 +22,12 @@ EventLogger::EventLogger() {
   m_enabled = (v != nullptr && std::strlen(v) > 0);
   const char* q = std::getenv("NS3_QUEUE_PROBE");
   m_queueProbe = (q != nullptr && std::strlen(q) > 0);
+  // No-progress stall watchdog window: default 100 ms of SIM-time with no acked-byte progress = a
+  // stall; NS3_STALL_MS=0 disables it. (Only ever armed when m_enabled -- vanilla ns-3 is untouched.)
+  const char* s = std::getenv("NS3_STALL_MS");
+  int64_t stall_ms = (s != nullptr && std::strlen(s) > 0) ? std::atoll(s) : 100;
+  if (stall_ms > 1000000) stall_ms = 1000000; // clamp (avoid int64 overflow in the *1e6 below; 1000 s max)
+  m_stallWindowNs = (stall_ms > 0) ? stall_ms * 1000000 : 0;
 }
 
 // Runs at program exit (after Simulator::Destroy), so it is the right place to
@@ -46,6 +52,9 @@ EventLogger::~EventLogger() {
 }
 
 namespace {
+// The stall watchdog re-checks progress every 1 ms of sim-time (cheap; a healthy run finishes long
+// before it can accumulate a full no-progress window).
+const int64_t kStallCheckIntervalNs = 1000000;
 // "sip:sport->dip:dport" -- the flow identity used by rate_update/qp_complete.
 // Ipv4Address streams as a dotted-quad, matching the FLOW_COMPLETE house style.
 void EmitFlow(std::ostream& os, const Ptr<RdmaQueuePair>& qp) {
@@ -84,6 +93,11 @@ void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
     m_queueProbeStarted = true;
     Simulator::Schedule(NanoSeconds(0), &EventLogger::PeriodicQueueDump, this);
   }
+  if (m_stallWindowNs > 0 && !m_stallStarted) { // arm the no-progress stall watchdog (once)
+    m_stallStarted = true;
+    m_lastProgressNs = t; // start the no-progress clock now (t = Now() ns, above)
+    Simulator::Schedule(NanoSeconds(kStallCheckIntervalNs), &EventLogger::StallCheck, this);
+  }
 }
 
 void EventLogger::OnRateUpdate(Ptr<RdmaQueuePair> qp, const char* why) {
@@ -108,6 +122,7 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
   for (auto it = group.begin(); it != group.end(); ++it) {
     if (*it == qp) { group.erase(it); break; }
   }
+  m_completedBytes += qp->m_size; // this flow's bytes are now permanently acked -> keeps "progress" monotonic
   std::cout << "EVENT qp_complete"
             << " t_ns=" << t
             << " flow=";
@@ -261,6 +276,55 @@ void EventLogger::PeriodicQueueDump() {
   if (!anyActive) { m_queueProbeStarted = false; return; } // idle -> stop, and re-arm for a later burst
   DumpAllQueues(Simulator::Now().GetNanoSeconds());
   Simulator::Schedule(NanoSeconds(5000), &EventLogger::PeriodicQueueDump, this);
+}
+
+// No-progress stall watchdog (armed from the first qp_add when NS3_STALL_MS>0; the one hook that
+// INTERVENES). "Progress" = completed flows' sizes + active flows' snd_una: it advances continuously in
+// a healthy run and jumps at completions, so a healthy run -- however slow -- never trips it. If it does
+// not advance for m_stallWindowNs of sim-time the run is wedged (a congestion deadlock / drop-storm
+// stall): emit "EVENT stall" + Simulator::Stop(), ending it early. The trace is then short of
+// all-flows-complete, so the decoder taints it (Incomplete). BOUNDED: stops rescheduling once nothing is
+// active (a healthy finish), like PeriodicQueueDump.
+void EventLogger::StallCheck() {
+  if (!m_enabled) return;
+  uint64_t total = m_completedBytes;
+  size_t activeN = 0;
+  for (const auto& kv : m_activeBySubnet) {
+    for (const Ptr<RdmaQueuePair>& qp : kv.second) { total += qp->snd_una; ++activeN; }
+  }
+  if (activeN == 0) { m_stallStarted = false; return; } // idle -> stop + RE-ARM for a later burst (like PeriodicQueueDump)
+  int64_t now = Simulator::Now().GetNanoSeconds();
+  if (total > m_lastProgress) {                          // forward progress -> reset the no-progress clock
+    m_lastProgress = total;
+    m_lastProgressNs = now;
+  } else if (now - m_lastProgressNs >= m_stallWindowNs) { // no progress for the whole window -> stalled
+    std::cout << "EVENT stall"
+              << " t_ns=" << now
+              << " no_progress_ns=" << (now - m_lastProgressNs)
+              << " active_n=" << activeN
+              << std::endl;
+    Simulator::Stop();
+    return;
+  }
+  Simulator::Schedule(NanoSeconds(kStallCheckIntervalNs), &EventLogger::StallCheck, this);
+}
+
+// INTERACTIVE QUERY: serialise the CURRENT state -- every active QP (all subnets) + every non-zero
+// egress backlog -- at Now(), in the same format the streaming hooks emit. Called by control.h on a
+// harness QUERY; unlike the automatic hooks this fires on demand, at an arbitrary paused instant.
+void EventLogger::DumpState() {
+  int64_t t = Simulator::Now().GetNanoSeconds();
+  for (const auto& kv : m_activeBySubnet) {
+    if (!kv.second.empty()) DumpActiveSet(t, kv.first);
+  }
+  DumpAllQueues(t);
+}
+
+// Active flow (QP) count across all subnets -- the "is the workload still running?" signal for control.h.
+uint32_t EventLogger::ActiveFlowCount() const {
+  uint32_t n = 0;
+  for (const auto& kv : m_activeBySubnet) n += (uint32_t)kv.second.size();
+  return n;
 }
 
 } // namespace ns3
