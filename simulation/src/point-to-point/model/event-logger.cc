@@ -56,10 +56,6 @@ void EmitFlow(std::ostream& os, const Ptr<RdmaQueuePair>& qp) {
 uint32_t SubnetKey(const Ptr<RdmaQueuePair>& qp) {
   return qp->sip.Get() & 0xFFFF0000u;
 }
-// Print a /16 subnet key as its first two octets, e.g. "11.2".
-void EmitSubnet(std::ostream& os, uint32_t key) {
-  os << ((key >> 24) & 0xFFu) << "." << ((key >> 16) & 0xFFu);
-}
 } // namespace
 
 void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
@@ -76,9 +72,7 @@ void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
             << " dport=" << qp->dport
             << " size_bytes=" << qp->m_size
             << " pg=" << qp->m_pg
-            << " subnet=";
-  EmitSubnet(std::cout, sub);
-  std::cout << " active_n=" << group.size() << std::endl;
+            << " active_n=" << group.size() << std::endl;
   DumpActiveSet(t, sub);
   if (m_queueProbe && !m_queueProbeStarted) { // opt-in (NS3_QUEUE_PROBE): start the mid-flight queue sample
     m_queueProbeStarted = true;
@@ -114,9 +108,7 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
   EmitFlow(std::cout, qp);
   std::cout << " fct_ns=" << fct_ns
             << " size_bytes=" << qp->m_size
-            << " subnet=";
-  EmitSubnet(std::cout, sub);
-  std::cout << " active_n=" << group.size() << std::endl;
+            << " active_n=" << group.size() << std::endl;
   DumpActiveSet(t, sub);
   DumpAllQueues(t); // the in-fabric / queue half of the post-completion (next) state
 }
@@ -204,9 +196,7 @@ void EventLogger::DumpActiveSet(int64_t t_ns, uint32_t subnetKey) {
     uint64_t remaining = (qp->m_size > qp->snd_nxt) ? (qp->m_size - qp->snd_nxt) : 0;
     std::cout << "EVENT active"
               << " t_ns=" << t_ns
-              << " subnet=";
-    EmitSubnet(std::cout, subnetKey);
-    std::cout << " flow=";
+              << " flow=";
     EmitFlow(std::cout, qp);
     std::cout << " sent_bytes=" << qp->snd_nxt
               << " acked_bytes=" << qp->snd_una
