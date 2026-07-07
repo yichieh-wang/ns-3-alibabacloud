@@ -49,18 +49,12 @@ public:
   // see the QP at its endpoints) cannot. Primitives only (no CustomHeader) so the
   // logger needs no extra ns-3 coupling; src/dst IPs are raw uint32 IPv4 and are
   // formatted via Ipv4Address(...) to the dotted-quad flow-id style.
-  // First sighting of a (switch,port,5-tuple) key emits one "EVENT switch_enter";
-  // per-key first_ns/last_ns/bytes accumulate and flush as "EVENT switch_flow" at
-  // logger destruction (program exit). Never per-packet spam.
+  // First sighting of a (switch,flow) opens a segment ("EVENT switch_enter"); a
+  // change of egress is a reroute (close old segment + open new); the segment
+  // closes as "EVENT switch_leave" at qp_complete. Never per-packet spam.
   void OnSwitchForward(uint32_t switch_id, uint32_t out_port, uint64_t bytes,
                        uint32_t src_ip, uint32_t dst_ip,
                        uint16_t sport, uint16_t dport);
-
-  // TOPOLOGY hook: a switch DECLARES its structural signature (e.g. "leaf"/"spine") into
-  // the event stream as one "EVENT switch_info switch=<id> sig=<sig>", so the cache can map
-  // node id -> signature FROM THE STREAM rather than hardcoding it. Emit once per switch at
-  // setup. Gated like every other event.
-  void OnSwitchInfo(uint32_t switch_id, const std::string& sig);
 
   // PFC hook: a QbbNetDevice's TX on (port, queue) PAUSES (it received a PFC PAUSE frame)
   // or RESUMES. Emitted ONLY on a real state TRANSITION -- no spam on the periodic
@@ -89,6 +83,11 @@ public:
   // RUN_UNTIL (active > 0, the workload continues) from an ENDED one (active == 0, the workload drained).
   uint32_t ActiveFlowCount() const;
 
+  // Emit every switch's port wiring as a block (NodeList walked in node-id order): that switch's "EVENT
+  // switch_port" lines, so a decoder rebuilds the REAL topology (incl. UNUSED ports) per switch. Each setup
+  // path calls this ONCE, right AFTER all wiring: it reports the current (fully-wired) state, no sim-event dependency.
+  void DumpAllSwitchInfo();
+
 private:
   EventLogger();
   ~EventLogger();
@@ -110,32 +109,40 @@ private:
   // each completion, and (only when NS3_QUEUE_PROBE is set) by the recurring mid-flight probe below.
   void DumpAllQueues(int64_t t_ns);
 
+  // Emit one "EVENT switch_port ..." per port of a switch declaring that port's peer (peer node,
+  // peer device index, switch|host), so a decoder rebuilds the REAL topology incl. UNUSED ports.
+  // Called by DumpAllSwitchInfo for each switch.
+  void EmitSwitchPorts(uint32_t switch_id);
+
   // Recurring mid-flight queue sample (every 5us from the first qp_add, stops when no flow is
   // active) -- the egress backlog only exists BETWEEN events, so completion-only sampling reads ~0.
   void PeriodicQueueDump();
   bool m_queueProbe = false;        // opt-in gate (NS3_QUEUE_PROBE): the 5us probe is heavy, off by default
   bool m_queueProbeStarted = false; // latched while a burst's probe loop is live; reset when it goes idle
 
-  // Per (switch, egress port, 5-tuple) traversal state for OnSwitchForward. Key is
-  // ordered (switch, port, src_ip, dst_ip, sport, dport) so the destructor flush is
-  // deterministic. first_ns set on first sight, last_ns updated each call, bytes summed.
+  // Per (switch, flow) traversal state for OnSwitchForward. Key is the (switch,
+  // 5-tuple) with NO egress port, so a flow that leaves an egress and later
+  // returns to it (an A->B->A reroute) does NOT merge with its earlier A-stint.
+  // Ordered so the destructor flush is deterministic.
   struct SwitchFlowKey {
     uint32_t switch_id;
-    uint32_t out_port;
     uint32_t src_ip;
     uint32_t dst_ip;
     uint16_t sport;
     uint16_t dport;
     bool operator<(const SwitchFlowKey& o) const {
       if (switch_id != o.switch_id) return switch_id < o.switch_id;
-      if (out_port  != o.out_port)  return out_port  < o.out_port;
       if (src_ip    != o.src_ip)    return src_ip    < o.src_ip;
       if (dst_ip    != o.dst_ip)    return dst_ip    < o.dst_ip;
       if (sport     != o.sport)     return sport     < o.sport;
       return dport < o.dport;
     }
   };
+  // The flow's CURRENT segment at this switch: the egress it uses now + that
+  // segment's first/last sighting + bytes. A change in out_port is a REROUTE --
+  // close the old segment (switch_leave) and open a new one (switch_enter).
   struct SwitchFlowStat {
+    uint32_t out_port;
     int64_t  first_ns;
     int64_t  last_ns;
     uint64_t bytes;

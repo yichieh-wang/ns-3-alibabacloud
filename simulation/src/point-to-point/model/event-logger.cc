@@ -2,6 +2,8 @@
 #include "switch-node.h"
 #include <ns3/simulator.h>
 #include <ns3/node-list.h>
+#include <ns3/net-device.h>
+#include <ns3/channel.h>
 #include <ns3/ipv4-address.h>
 #include <algorithm>
 #include <cstdint>
@@ -24,27 +26,6 @@ EventLogger::EventLogger() {
   m_queueProbe = (q != nullptr && std::strlen(q) > 0);
 }
 
-// Runs at program exit (after Simulator::Destroy), so it is the right place to
-// flush the per-(switch,port,flow) traversal summary. One "EVENT switch_flow"
-// line per key; the map is ordered so output is deterministic. No-op when off
-// (the map is never populated when disabled).
-EventLogger::~EventLogger() {
-  if (!m_enabled) return;
-  for (const auto& kv : m_switchFlows) {
-    const SwitchFlowKey& k = kv.first;
-    const SwitchFlowStat& s = kv.second;
-    std::cout << "EVENT switch_flow"
-              << " switch=" << k.switch_id
-              << " port=" << k.out_port
-              << " flow=" << Ipv4Address(k.src_ip) << ":" << k.sport
-              << "->" << Ipv4Address(k.dst_ip) << ":" << k.dport
-              << " first_ns=" << s.first_ns
-              << " last_ns=" << s.last_ns
-              << " bytes=" << s.bytes
-              << std::endl;
-  }
-}
-
 namespace {
 // "sip:sport->dip:dport" -- the flow identity used by rate_update/qp_complete.
 // Ipv4Address streams as a dotted-quad, matching the FLOW_COMPLETE house style.
@@ -56,7 +37,48 @@ void EmitFlow(std::ostream& os, const Ptr<RdmaQueuePair>& qp) {
 uint32_t SubnetKey(const Ptr<RdmaQueuePair>& qp) {
   return qp->sip.Get() & 0xFFFF0000u;
 }
+// One "EVENT switch_enter" -- a flow opened a segment on (switch, egress port).
+void EmitSwitchEnter(int64_t t, uint32_t sw, uint32_t port,
+                     uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
+  // HEADS-UP: byte-level queue snapshot (per-pg backlog at entry) attaches here later (§4.4 byte-level phase).
+  std::cout << "EVENT switch_enter"
+            << " t_ns=" << t
+            << " switch=" << sw
+            << " egress_port=" << port
+            << " flow=" << Ipv4Address(sip) << ":" << sport
+            << "->" << Ipv4Address(dip) << ":" << dport
+            << std::endl;
+}
+// One "EVENT switch_leave" -- a flow closed a segment on (switch, egress port),
+// by reroute, qp_complete, or the exit flush.
+void EmitSwitchLeave(uint32_t sw, uint32_t port,
+                     uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport,
+                     int64_t leave_ns, uint64_t bytes) {
+  // HEADS-UP: byte-level queue snapshot (per-pg backlog at leave) attaches here later (§4.4 byte-level phase).
+  std::cout << "EVENT switch_leave"
+            << " switch=" << sw
+            << " egress_port=" << port
+            << " flow=" << Ipv4Address(sip) << ":" << sport
+            << "->" << Ipv4Address(dip) << ":" << dport
+            << " leave_ns=" << leave_ns
+            << " bytes=" << bytes
+            << std::endl;
+}
 } // namespace
+
+// Runs at program exit (after Simulator::Destroy). Any entry still here is a
+// leftover segment for a flow that never reached qp_complete (uncompleted-flow
+// fallback); flush it as a final switch_leave. The map is ordered so output is
+// deterministic. No-op when off (the map is never populated when disabled).
+EventLogger::~EventLogger() {
+  if (!m_enabled) return;
+  for (const auto& kv : m_switchFlows) {
+    const SwitchFlowKey& k = kv.first;
+    const SwitchFlowStat& s = kv.second;
+    EmitSwitchLeave(k.switch_id, s.out_port, k.src_ip, k.dst_ip, k.sport, k.dport,
+                    s.last_ns, s.bytes);
+  }
+}
 
 void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
   if (!m_enabled) return;
@@ -111,44 +133,86 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
             << " active_n=" << group.size() << std::endl;
   DumpActiveSet(t, sub);
   DumpAllQueues(t); // the in-fabric / queue half of the post-completion (next) state
+  // The flow has now departed every hop: emit its per-hop switch_leave HERE (at completion,
+  // not at program exit), then drop the entries so a recycled 4-tuple starts a fresh traversal.
+  uint32_t sip = qp->sip.Get(), dip = qp->dip.Get();
+  for (auto it = m_switchFlows.begin(); it != m_switchFlows.end(); ) {
+    const SwitchFlowKey& k = it->first;
+    if (k.src_ip == sip && k.dst_ip == dip && k.sport == qp->sport && k.dport == qp->dport) {
+      const SwitchFlowStat& s = it->second;
+      EmitSwitchLeave(k.switch_id, s.out_port, k.src_ip, k.dst_ip, k.sport, k.dport,
+                      s.last_ns, s.bytes);
+      it = m_switchFlows.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
-// SWITCH-SIDE traversal hook. Called per data packet from SwitchNode::SendToDev,
-// but only EMITS on the FIRST sighting of a (switch, port, 5-tuple) key -- this is
-// the RAW "flow entered this switch via this egress port" event. Per-key timing
-// (first_ns/last_ns) + byte counts accumulate silently and flush at destruction.
+// SWITCH-SIDE traversal hook. Called per data packet from SwitchNode::SendToDev.
+// Keyed by (switch, flow): the first sighting opens a segment (switch_enter);
+// same-egress packets accumulate silently; a CHANGE of egress is a REROUTE --
+// close the old segment (switch_leave) and open a fresh one (switch_enter).
 void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t out_port,
                                   uint64_t bytes, uint32_t src_ip, uint32_t dst_ip,
                                   uint16_t sport, uint16_t dport) {
   if (!m_enabled) return;
   int64_t t = Simulator::Now().GetNanoSeconds();
-  SwitchFlowKey key{switch_id, out_port, src_ip, dst_ip, sport, dport};
+  SwitchFlowKey key{switch_id, src_ip, dst_ip, sport, dport};
   auto it = m_switchFlows.find(key);
   if (it == m_switchFlows.end()) {
-    // First time this flow is seen at this switch+port: emit the enter event.
-    m_switchFlows.emplace(key, SwitchFlowStat{t, t, bytes});
-    std::cout << "EVENT switch_enter"
-              << " t_ns=" << t
-              << " switch=" << switch_id
-              << " port=" << out_port
-              << " flow=" << Ipv4Address(src_ip) << ":" << sport
-              << "->" << Ipv4Address(dst_ip) << ":" << dport
-              << std::endl;
-  } else {
-    // Already seen: just fold in this packet's timing + bytes (no per-packet line).
+    // First sighting: open the flow's segment at this switch.
+    m_switchFlows.emplace(key, SwitchFlowStat{out_port, t, t, bytes});
+    EmitSwitchEnter(t, switch_id, out_port, src_ip, dst_ip, sport, dport);
+  } else if (it->second.out_port == out_port) {
+    // Same egress: fold in this packet's timing + bytes (no per-packet line).
     it->second.last_ns = t;
     it->second.bytes += bytes;
+  } else {
+    // REROUTE: egress changed -- close the old segment, open a new one.
+    EmitSwitchLeave(switch_id, it->second.out_port, src_ip, dst_ip, sport, dport,
+                    it->second.last_ns, it->second.bytes);
+    it->second = SwitchFlowStat{out_port, t, t, bytes};
+    EmitSwitchEnter(t, switch_id, out_port, src_ip, dst_ip, sport, dport);
   }
 }
 
-// TOPOLOGY hook: a switch declares its structural signature so the cache can map
-// node id -> signature from the stream instead of hardcoding it. Once per switch at setup.
-void EventLogger::OnSwitchInfo(uint32_t switch_id, const std::string& sig) {
+// Walk every node in node-id order; for each SwitchNode emit its port wiring as a block of "EVENT
+// switch_port" lines. Each setup path calls this ONCE after wiring, so the reported state is the
+// current fully-wired fabric (no reliance on a sim-time-0 event).
+void EventLogger::DumpAllSwitchInfo() {
   if (!m_enabled) return;
-  std::cout << "EVENT switch_info"
-            << " switch=" << switch_id
-            << " sig=" << sig
-            << std::endl;
+  for (uint32_t i = 0; i < NodeList::GetNNodes(); i++) {
+    Ptr<Node> node = NodeList::GetNode(i);
+    if (!DynamicCast<SwitchNode>(node)) continue;
+    EmitSwitchPorts(node->GetId());
+  }
+}
+
+// One "EVENT switch_port ..." per port of a switch, giving that port's peer, so a decoder can
+// rebuild the REAL topology (EVERY port incl. ones no flow used). Called by DumpAllSwitchInfo per switch.
+void EventLogger::EmitSwitchPorts(uint32_t switch_id) {
+  if (!m_enabled) return;
+  Ptr<Node> sw = NodeList::GetNode(switch_id);
+  if (!sw) return;
+  for (uint32_t p = 0; p < sw->GetNDevices(); p++) {
+    Ptr<NetDevice> dev = sw->GetDevice(p);
+    Ptr<Channel> ch = dev ? dev->GetChannel() : nullptr;
+    if (!ch || ch->GetNDevices() < 2) continue; // unconnected port: skip, don't crash
+    Ptr<NetDevice> peer = (ch->GetDevice(0) == dev) ? ch->GetDevice(1) : ch->GetDevice(0);
+    Ptr<Node> peerNode = peer->GetNode();
+    uint32_t peerPort = 0; // peer's device index for this link (loop to find it)
+    for (uint32_t i = 0; i < peerNode->GetNDevices(); i++) {
+      if (peerNode->GetDevice(i) == peer) { peerPort = i; break; }
+    }
+    std::cout << "EVENT switch_port"
+              << " switch=" << switch_id
+              << " port=" << p
+              << " peer_node=" << peerNode->GetId()
+              << " peer_port=" << peerPort
+              << " peer_kind=" << (DynamicCast<SwitchNode>(peerNode) ? "switch" : "host")
+              << std::endl;
+  }
 }
 
 // PFC hook: one line per pause/resume STATE TRANSITION on a (node, port, queue), emitted
@@ -229,7 +293,7 @@ void EventLogger::DumpAllQueues(int64_t t_ns) {
         std::cout << "EVENT queue"
                   << " t_ns=" << t_ns
                   << " switch=" << sw->GetId()
-                  << " port=" << port
+                  << " egress_port=" << port
                   << " pg=" << pg
                   << " bytes=" << qbytes
                   << std::endl;
