@@ -177,40 +177,40 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t out_port,
   }
 }
 
-// Walk every node in node-id order; for each SwitchNode emit its port wiring as a block of "EVENT
-// switch_port" lines. Each setup path calls this ONCE after wiring, so the reported state is the
+// Walk EVERY node in node-id order and emit its port wiring as a block of "EVENT node_port" lines
+// (hosts AND switches). Each setup path calls this ONCE after wiring, so the reported state is the
 // current fully-wired fabric (no reliance on a sim-time-0 event).
-void EventLogger::DumpAllSwitchInfo() {
+void EventLogger::DumpAllNodeInfo() {
   if (!m_enabled) return;
   for (uint32_t i = 0; i < NodeList::GetNNodes(); i++) {
-    Ptr<Node> node = NodeList::GetNode(i);
-    if (!DynamicCast<SwitchNode>(node)) continue;
-    EmitSwitchPorts(node->GetId());
+    EmitNodePorts(NodeList::GetNode(i)->GetId());
   }
 }
 
-// One "EVENT switch_port ..." per port of a switch, giving that port's peer, so a decoder can
-// rebuild the REAL topology (EVERY port incl. ones no flow used). Called by DumpAllSwitchInfo per switch.
-void EventLogger::EmitSwitchPorts(uint32_t switch_id) {
+// One "EVENT node_port ..." per CONNECTED port of a node, giving that port's peer plus the RAW TypeId
+// class names of both ends (e.g. ns3::SwitchNode / ns3::Node), so a decoder rebuilds the REAL topology
+// (EVERY connected port incl. ones no flow used). Called by DumpAllNodeInfo per node.
+void EventLogger::EmitNodePorts(uint32_t node_id) {
   if (!m_enabled) return;
-  Ptr<Node> sw = NodeList::GetNode(switch_id);
-  if (!sw) return;
-  for (uint32_t p = 0; p < sw->GetNDevices(); p++) {
-    Ptr<NetDevice> dev = sw->GetDevice(p);
+  Ptr<Node> node = NodeList::GetNode(node_id);
+  if (!node) return;
+  for (uint32_t p = 0; p < node->GetNDevices(); p++) {
+    Ptr<NetDevice> dev = node->GetDevice(p);
     Ptr<Channel> ch = dev ? dev->GetChannel() : nullptr;
-    if (!ch || ch->GetNDevices() < 2) continue; // unconnected port: skip, don't crash
+    if (!ch || ch->GetNDevices() < 2) continue; // loopback / unconnected port: skip, don't crash
     Ptr<NetDevice> peer = (ch->GetDevice(0) == dev) ? ch->GetDevice(1) : ch->GetDevice(0);
     Ptr<Node> peerNode = peer->GetNode();
     uint32_t peerPort = 0; // peer's device index for this link (loop to find it)
     for (uint32_t i = 0; i < peerNode->GetNDevices(); i++) {
       if (peerNode->GetDevice(i) == peer) { peerPort = i; break; }
     }
-    std::cout << "EVENT switch_port"
-              << " switch=" << switch_id
+    std::cout << "EVENT node_port"
+              << " node=" << node_id
+              << " class=" << node->GetInstanceTypeId().GetName()
               << " port=" << p
               << " peer_node=" << peerNode->GetId()
               << " peer_port=" << peerPort
-              << " peer_kind=" << (DynamicCast<SwitchNode>(peerNode) ? "switch" : "host")
+              << " peer_class=" << peerNode->GetInstanceTypeId().GetName()
               << std::endl;
   }
 }

@@ -83,10 +83,11 @@ public:
   // RUN_UNTIL (active > 0, the workload continues) from an ENDED one (active == 0, the workload drained).
   uint32_t ActiveFlowCount() const;
 
-  // Emit every switch's port wiring as a block (NodeList walked in node-id order): that switch's "EVENT
-  // switch_port" lines, so a decoder rebuilds the REAL topology (incl. UNUSED ports) per switch. Each setup
-  // path calls this ONCE, right AFTER all wiring: it reports the current (fully-wired) state, no sim-event dependency.
-  void DumpAllSwitchInfo();
+  // Emit EVERY node's port wiring as a block (NodeList walked in node-id order): each node's "EVENT
+  // node_port" lines (RAW TypeId class names for the node + its peer), so a decoder rebuilds the REAL
+  // topology (incl. UNUSED ports) for hosts AND switches. Each setup path calls this ONCE, right AFTER
+  // all wiring: it reports the current (fully-wired) state, no sim-event dependency.
+  void DumpAllNodeInfo();
 
 private:
   EventLogger();
@@ -109,10 +110,10 @@ private:
   // each completion, and (only when NS3_QUEUE_PROBE is set) by the recurring mid-flight probe below.
   void DumpAllQueues(int64_t t_ns);
 
-  // Emit one "EVENT switch_port ..." per port of a switch declaring that port's peer (peer node,
-  // peer device index, switch|host), so a decoder rebuilds the REAL topology incl. UNUSED ports.
-  // Called by DumpAllSwitchInfo for each switch.
-  void EmitSwitchPorts(uint32_t switch_id);
+  // Emit one "EVENT node_port ..." per CONNECTED port of a node declaring that port's peer (peer node,
+  // peer device index) with RAW TypeId class names for BOTH ends, so a decoder rebuilds the REAL
+  // topology incl. UNUSED ports. Called by DumpAllNodeInfo for each node.
+  void EmitNodePorts(uint32_t node_id);
 
   // Recurring mid-flight queue sample (every 5us from the first qp_add, stops when no flow is
   // active) -- the egress backlog only exists BETWEEN events, so completion-only sampling reads ~0.
