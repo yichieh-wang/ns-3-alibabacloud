@@ -83,10 +83,10 @@ public:
   // RUN_UNTIL (active > 0, the workload continues) from an ENDED one (active == 0, the workload drained).
   uint32_t ActiveFlowCount() const;
 
-  // Emit EVERY node's port wiring as a block (NodeList walked in node-id order): each node's "EVENT
-  // node_port" lines (RAW TypeId class names for the node + its peer), so a decoder rebuilds the REAL
-  // topology (incl. UNUSED ports) for hosts AND switches. Each setup path calls this ONCE, right AFTER
-  // all wiring: it reports the current (fully-wired) state, no sim-event dependency.
+  // Emit the fabric as a block (NodeList walked in node-id order): one "EVENT node" per node (RAW TypeId
+  // class; a HOST also carries its cca + ip) then one "EVENT link" per link (bw + delay, printed once
+  // from its lower-id endpoint). A decoder rebuilds the REAL topology (incl. UNUSED ports) into a
+  // Netlist. Each setup path calls this ONCE after wiring: it reports the current fully-wired state.
   void DumpAllNodeInfo();
 
 private:
@@ -110,10 +110,12 @@ private:
   // each completion, and (only when NS3_QUEUE_PROBE is set) by the recurring mid-flight probe below.
   void DumpAllQueues(int64_t t_ns);
 
-  // Emit one "EVENT node_port ..." per CONNECTED port of a node declaring that port's peer (peer node,
-  // peer device index) with RAW TypeId class names for BOTH ends, so a decoder rebuilds the REAL
-  // topology incl. UNUSED ports. Called by DumpAllNodeInfo for each node.
-  void EmitNodePorts(uint32_t node_id);
+  // "EVENT node id=<id> class=<TypeId>" for one node; a HOST (non-switch) also carries " cca=<..> ip=<..>"
+  // (its RdmaHw CcMode + Ipv4). Called by DumpAllNodeInfo per node.
+  void EmitNode(uint32_t node_id);
+  // "EVENT link a_node=.. a_port=.. b_node=.. b_port=.. bw=.. delay_ns=.." for each CONNECTED port of a
+  // node, emitted ONCE per link (only when this node id < the peer's, so the pair isn't printed twice).
+  void EmitNodeLinks(uint32_t node_id);
 
   // Recurring mid-flight queue sample (every 5us from the first qp_add, stops when no flow is
   // active) -- the egress backlog only exists BETWEEN events, so completion-only sampling reads ~0.

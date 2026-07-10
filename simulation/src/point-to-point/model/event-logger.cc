@@ -1,10 +1,15 @@
 #include "event-logger.h"
 #include "switch-node.h"
+#include "point-to-point-net-device.h"
+#include "qbb-channel.h"
+#include "rdma-driver.h"
 #include <ns3/simulator.h>
 #include <ns3/node-list.h>
 #include <ns3/net-device.h>
 #include <ns3/channel.h>
+#include <ns3/ipv4.h>
 #include <ns3/ipv4-address.h>
+#include <ns3/data-rate.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -63,6 +68,10 @@ void EmitSwitchLeave(uint32_t sw, uint32_t port,
             << " leave_ns=" << leave_ns
             << " bytes=" << bytes
             << std::endl;
+}
+// The cca string for an RdmaHw CcMode (the config's cca<->CcMode mapping, DCQCN == 1).
+const char* CcaName(uint32_t ccMode) {
+  return ccMode == 1 ? "dcqcn" : "unknown";
 }
 } // namespace
 
@@ -177,21 +186,34 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t out_port,
   }
 }
 
-// Walk EVERY node in node-id order and emit its port wiring as a block of "EVENT node_port" lines
-// (hosts AND switches). Each setup path calls this ONCE after wiring, so the reported state is the
-// current fully-wired fabric (no reliance on a sim-time-0 event).
+// Emit the whole fabric: one "EVENT node" per node, then one "EVENT link" per link (each printed once).
+// NodeList in id order; each setup path calls this ONCE after wiring (report-current-state).
 void EventLogger::DumpAllNodeInfo() {
   if (!m_enabled) return;
-  for (uint32_t i = 0; i < NodeList::GetNNodes(); i++) {
-    EmitNodePorts(NodeList::GetNode(i)->GetId());
-  }
+  for (uint32_t i = 0; i < NodeList::GetNNodes(); i++) EmitNode(NodeList::GetNode(i)->GetId());
+  for (uint32_t i = 0; i < NodeList::GetNNodes(); i++) EmitNodeLinks(NodeList::GetNode(i)->GetId());
 }
 
-// One "EVENT node_port ..." per CONNECTED port of a node, giving that port's peer plus the RAW TypeId
-// class names of both ends (e.g. ns3::SwitchNode / ns3::Node), so a decoder rebuilds the REAL topology
-// (EVERY connected port incl. ones no flow used). Called by DumpAllNodeInfo per node.
-void EventLogger::EmitNodePorts(uint32_t node_id) {
-  if (!m_enabled) return;
+// One "EVENT node" for a node: its id + RAW TypeId class. A HOST (non-switch) also carries the
+// build-only params the structure can't show -- its RdmaHw cca + Ipv4 address (each guarded so a host
+// without a full RDMA/IP stack still emits id + class).
+void EventLogger::EmitNode(uint32_t node_id) {
+  Ptr<Node> node = NodeList::GetNode(node_id);
+  if (!node) return;
+  std::cout << "EVENT node id=" << node_id << " class=" << node->GetInstanceTypeId().GetName();
+  if (!DynamicCast<SwitchNode>(node)) {
+    Ptr<RdmaDriver> drv = node->GetObject<RdmaDriver>();
+    if (drv && drv->m_rdma) std::cout << " cca=" << CcaName(drv->m_rdma->m_cc_mode);
+    Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
+    if (ipv4 && ipv4->GetNInterfaces() > 1) std::cout << " ip=" << ipv4->GetAddress(1, 0).GetLocal();
+  }
+  std::cout << std::endl;
+}
+
+// One "EVENT link" per CONNECTED port of a node, emitted ONCE per link: only from the lower-id endpoint
+// (node_id < peer node id), so each QbbChannel prints a single line. Carries the link's bw (the port's
+// DataRate) + delay (the channel delay) -- the media params a decoder needs to rebuild the Netlist.
+void EventLogger::EmitNodeLinks(uint32_t node_id) {
   Ptr<Node> node = NodeList::GetNode(node_id);
   if (!node) return;
   for (uint32_t p = 0; p < node->GetNDevices(); p++) {
@@ -200,18 +222,19 @@ void EventLogger::EmitNodePorts(uint32_t node_id) {
     if (!ch || ch->GetNDevices() < 2) continue; // loopback / unconnected port: skip, don't crash
     Ptr<NetDevice> peer = (ch->GetDevice(0) == dev) ? ch->GetDevice(1) : ch->GetDevice(0);
     Ptr<Node> peerNode = peer->GetNode();
+    if (node_id >= peerNode->GetId()) continue; // DEDUP: print the link once, from its lower-id end
     uint32_t peerPort = 0; // peer's device index for this link (loop to find it)
     for (uint32_t i = 0; i < peerNode->GetNDevices(); i++) {
       if (peerNode->GetDevice(i) == peer) { peerPort = i; break; }
     }
-    std::cout << "EVENT node_port"
-              << " node=" << node_id
-              << " class=" << node->GetInstanceTypeId().GetName()
-              << " port=" << p
-              << " peer_node=" << peerNode->GetId()
-              << " peer_port=" << peerPort
-              << " peer_class=" << peerNode->GetInstanceTypeId().GetName()
-              << std::endl;
+    std::cout << "EVENT link"
+              << " a_node=" << node_id << " a_port=" << p
+              << " b_node=" << peerNode->GetId() << " b_port=" << peerPort;
+    Ptr<PointToPointNetDevice> p2p = DynamicCast<PointToPointNetDevice>(dev);
+    Ptr<QbbChannel> qbbCh = DynamicCast<QbbChannel>(ch); // QbbChannel re-exposes GetDelay publicly
+    if (p2p) std::cout << " bw=" << p2p->GetDataRate();
+    if (qbbCh) std::cout << " delay_ns=" << qbbCh->GetDelay().GetNanoSeconds();
+    std::cout << std::endl;
   }
 }
 
