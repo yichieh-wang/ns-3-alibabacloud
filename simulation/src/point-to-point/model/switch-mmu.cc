@@ -37,6 +37,12 @@ namespace ns3 {
 		memset(ingress_bytes, 0, sizeof(ingress_bytes));
 		memset(paused, 0, sizeof(paused));
 		memset(egress_bytes, 0, sizeof(egress_bytes));
+		// Per-port config arrays are set by ConfigEcn / the program before use; zero them so a stray
+		// pre-config read is defined rather than UB.
+		memset(kmin, 0, sizeof(kmin));
+		memset(kmax, 0, sizeof(kmax));
+		memset(pmax, 0, sizeof(pmax));
+		memset(pfc_a_shift, 0, sizeof(pfc_a_shift));
 
 		// Seed from the run's global RngSeed: identical switches draw identically, and the run controls it.
 		m_ecnRng.seed(RngSeedManager::GetSeed());
