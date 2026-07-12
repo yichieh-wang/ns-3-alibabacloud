@@ -2,6 +2,7 @@
 #define SWITCH_MMU_H
 
 #include <unordered_map>
+#include <random>
 #include <ns3/node.h>
 
 namespace ns3 {
@@ -59,6 +60,10 @@ public:
 	uint32_t ingress_bytes[pCnt][qCnt];
 	uint32_t paused[pCnt][qCnt];
 	uint64_t egress_bytes[pCnt][qCnt];
+
+	// Per-switch ECN-marking RNG: its own stream (not the shared global RV), seeded from the run's
+	// global RngSeed -> structurally-identical switches draw identically (spatial-reuse soundness).
+	std::mt19937_64 m_ecnRng;
 };
 
 } /* namespace ns3 */

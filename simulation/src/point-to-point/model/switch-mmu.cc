@@ -10,6 +10,7 @@
 #include "ns3/boolean.h"
 #include "ns3/simulator.h"
 #include "ns3/random-variable.h"
+#include "ns3/rng-seed-manager.h"
 #include "switch-mmu.h"
 #include "event-logger.h"
 
@@ -36,6 +37,9 @@ namespace ns3 {
 		memset(ingress_bytes, 0, sizeof(ingress_bytes));
 		memset(paused, 0, sizeof(paused));
 		memset(egress_bytes, 0, sizeof(egress_bytes));
+
+		// Seed from the run's global RngSeed: identical switches draw identically, and the run controls it.
+		m_ecnRng.seed(RngSeedManager::GetSeed());
 	}
 	bool SwitchMmu::CheckIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
 		if (psize + hdrm_bytes[port][qIndex] > headroom[port] && psize + GetSharedUsed(port, qIndex) > GetPfcThreshold(port)){
@@ -104,7 +108,7 @@ namespace ns3 {
 			return true;
 		if (egress_bytes[ifindex][qIndex] > kmin[ifindex]){
 			double p = pmax[ifindex] * double(egress_bytes[ifindex][qIndex] - kmin[ifindex]) / (kmax[ifindex] - kmin[ifindex]);
-			if (UniformVariable(0, 1).GetValue() < p)
+			if (std::uniform_real_distribution<double>(0.0, 1.0)(m_ecnRng) < p)
 				return true;
 		}
 		return false;
