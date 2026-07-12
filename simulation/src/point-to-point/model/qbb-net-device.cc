@@ -38,6 +38,7 @@
 #include "ns3/point-to-point-channel.h"
 #include "ns3/qbb-channel.h"
 #include "ns3/random-variable.h"
+#include "ns3/rng-seed-manager.h"
 #include "ns3/flow-id-tag.h"
 #include "event-logger.h"
 #include "ns3/qbb-header.h"
@@ -248,6 +249,7 @@ namespace ns3 {
 		}
 
 		m_rdmaEQ = CreateObject<RdmaEgressQueue>();
+		m_pfcIpRng.seed(RngSeedManager::GetSeed()); // per-device stream for the cosmetic PFC IP id
 	}
 
 	QbbNetDevice::~QbbNetDevice()
@@ -560,7 +562,7 @@ namespace ns3 {
 		ipv4h.SetDestination(Ipv4Address("255.255.255.255"));
 		ipv4h.SetPayloadSize(p->GetSize());
 		ipv4h.SetTtl(1);
-		ipv4h.SetIdentification(UniformVariable(0, 65536).GetValue());
+		ipv4h.SetIdentification(m_pfcIpRng() & 0xFFFF); // per-device RNG, off the process-global RNG
 		p->AddHeader(ipv4h);
 		AddHeader(p, 0x800);
 		CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);

@@ -32,6 +32,7 @@
 #include <vector>
 #include<map>
 #include <ns3/rdma.h>
+#include <random>
 
 namespace ns3 {
 
@@ -190,6 +191,10 @@ protected:
   };
 
   std::vector<ECNAccount> *m_ecn_source;
+
+  // Per-device RNG for the cosmetic PFC pause-frame IP id: its own stream (seeded from RngSeed), so it
+  // stays off the process-global RNG -> identical devices draw identically.
+  std::mt19937 m_pfcIpRng;
 
 public:
 	Ptr<RdmaEgressQueue> m_rdmaEQ;
