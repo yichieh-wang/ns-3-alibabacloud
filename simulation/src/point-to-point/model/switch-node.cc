@@ -111,11 +111,17 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 	if (idx >= 0){
 		NS_ASSERT_MSG(m_devices[idx]->IsLinkUp(), "The routing table look up should return link that is up");
 
+		// The ingress device index (the port this packet arrived on), carried in its FlowIdTag. Read up
+		// here so the switch-side instrumentation can report it too; admission control below reuses it.
+		FlowIdTag t;
+		p->PeekPacketTag(t);
+		uint32_t inDev = t.GetFlowId();
+
 		// SWITCH-SIDE flow instrumentation (observe-only; no-op unless NS3_EVENTS set).
-		// Report this DATA flow's traversal at (this switch, egress port idx) so post-
-		// processing can reconstruct transit paths + reroute bubbles. Data packets only.
+		// Report this DATA flow's traversal at (this switch, ingress port inDev, egress port idx) so
+		// post-processing can reconstruct transit paths + reroute bubbles. Data packets only.
 		if (ch.l3Prot == 0x11)
-			EventLogger::Get().OnSwitchForward(GetId(), (uint32_t)idx, p->GetSize(), ch.sip, ch.dip, ch.udp.sport, ch.udp.dport);
+			EventLogger::Get().OnSwitchForward(GetId(), inDev, (uint32_t)idx, p->GetSize(), ch.sip, ch.dip, ch.udp.sport, ch.udp.dport);
 
 		// determine the qIndex
 		uint32_t qIndex;
@@ -127,9 +133,6 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 		// std::cout << "qIndex is: " << qIndex << std::endl;
 
 		// admission control
-		FlowIdTag t;
-		p->PeekPacketTag(t);
-		uint32_t inDev = t.GetFlowId();
 		if (qIndex != 0){ //not highest priority
 			if (m_mmu->CheckIngressAdmission(inDev, qIndex, p->GetSize()) && m_mmu->CheckEgressAdmission(idx, qIndex, p->GetSize())){			// Admission control
 				m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());

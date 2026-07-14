@@ -49,11 +49,12 @@ public:
   // see the QP at its endpoints) cannot. Primitives only (no CustomHeader) so the
   // logger needs no extra ns-3 coupling; src/dst IPs are raw uint32 IPv4 and are
   // formatted via Ipv4Address(...) to the dotted-quad flow-id style.
-  // First sighting of a (switch,flow) opens a segment ("EVENT switch_enter"); a
+  // First sighting of a (switch,flow) opens a segment ("EVENT switch_enter",
+  // carrying both the ingress NetDevice in_port and the egress out_port); a
   // change of egress is a reroute (close old segment + open new); the segment
   // closes as "EVENT switch_leave" at qp_complete. Never per-packet spam.
-  void OnSwitchForward(uint32_t switch_id, uint32_t out_port, uint64_t bytes,
-                       uint32_t src_ip, uint32_t dst_ip,
+  void OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t out_port,
+                       uint64_t bytes, uint32_t src_ip, uint32_t dst_ip,
                        uint16_t sport, uint16_t dport);
 
   // PFC hook: a QbbNetDevice's TX on (port, queue) PAUSES (it received a PFC PAUSE frame)
@@ -76,7 +77,7 @@ public:
 
   // INTERACTIVE-mode accessor: on a harness QUERY, serialise the CURRENT state -- one "EVENT active" per
   // active QP (all subnets) + one "EVENT queue" per non-zero egress backlog -- at Simulator::Now(). Same
-  // key=value format the streaming hooks use, so the Rust decoder reads it unchanged. Used by control.h.
+  // key=value format the streaming hooks use, so the Rust parser reads it unchanged. Used by control.h.
   void DumpState();
 
   // Number of currently-active flows (QPs) across all subnets -- control.h uses it to tell a PAUSED
@@ -85,7 +86,7 @@ public:
 
   // Emit the fabric as a block (NodeList walked in node-id order): one "EVENT node" per node (RAW TypeId
   // class; a HOST also carries its cca + ip) then one "EVENT link" per link (bw + delay, printed once
-  // from its lower-id endpoint). A decoder rebuilds the REAL topology (incl. UNUSED ports) into a
+  // from its lower-id endpoint). A parser rebuilds the REAL topology (incl. UNUSED ports) into a
   // Netlist. Each setup path calls this ONCE after wiring: it reports the current fully-wired state.
   void DumpAllNodeInfo();
 
@@ -106,7 +107,7 @@ private:
 
   // Emit one "EVENT queue ..." line per (switch, egress port, priority-group) that has a NON-ZERO
   // egress backlog (an absent one == 0), for every SwitchNode (no subnet filter) -- the in-fabric /
-  // queue half of a mid-flight state. The Rust decoder/example picks the ports that matter. Called at
+  // queue half of a mid-flight state. The Rust parser/example picks the ports that matter. Called at
   // each completion, and (only when NS3_QUEUE_PROBE is set) by the recurring mid-flight probe below.
   void DumpAllQueues(int64_t t_ns);
 

@@ -42,13 +42,15 @@ void EmitFlow(std::ostream& os, const Ptr<RdmaQueuePair>& qp) {
 uint32_t SubnetKey(const Ptr<RdmaQueuePair>& qp) {
   return qp->sip.Get() & 0xFFFF0000u;
 }
-// One "EVENT switch_enter" -- a flow opened a segment on (switch, egress port).
-void EmitSwitchEnter(int64_t t, uint32_t sw, uint32_t port,
+// One "EVENT switch_enter" -- a flow opened a segment on (switch, egress port),
+// arriving on ingress NetDevice in_port (the boundary cut a parser anchors entry_port on).
+void EmitSwitchEnter(int64_t t, uint32_t sw, uint32_t in_port, uint32_t port,
                      uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
   // HEADS-UP: byte-level queue snapshot (per-pg backlog at entry) attaches here later (§4.4 byte-level phase).
   std::cout << "EVENT switch_enter"
             << " t_ns=" << t
             << " switch=" << sw
+            << " ingress_port=" << in_port
             << " egress_port=" << port
             << " flow=" << Ipv4Address(sip) << ":" << sport
             << "->" << Ipv4Address(dip) << ":" << dport
@@ -162,7 +164,7 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
 // Keyed by (switch, flow): the first sighting opens a segment (switch_enter);
 // same-egress packets accumulate silently; a CHANGE of egress is a REROUTE --
 // close the old segment (switch_leave) and open a fresh one (switch_enter).
-void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t out_port,
+void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t out_port,
                                   uint64_t bytes, uint32_t src_ip, uint32_t dst_ip,
                                   uint16_t sport, uint16_t dport) {
   if (!m_enabled) return;
@@ -172,7 +174,7 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t out_port,
   if (it == m_switchFlows.end()) {
     // First sighting: open the flow's segment at this switch.
     m_switchFlows.emplace(key, SwitchFlowStat{out_port, t, t, bytes});
-    EmitSwitchEnter(t, switch_id, out_port, src_ip, dst_ip, sport, dport);
+    EmitSwitchEnter(t, switch_id, in_port, out_port, src_ip, dst_ip, sport, dport);
   } else if (it->second.out_port == out_port) {
     // Same egress: fold in this packet's timing + bytes (no per-packet line).
     it->second.last_ns = t;
@@ -182,7 +184,7 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t out_port,
     EmitSwitchLeave(switch_id, it->second.out_port, src_ip, dst_ip, sport, dport,
                     it->second.last_ns, it->second.bytes);
     it->second = SwitchFlowStat{out_port, t, t, bytes};
-    EmitSwitchEnter(t, switch_id, out_port, src_ip, dst_ip, sport, dport);
+    EmitSwitchEnter(t, switch_id, in_port, out_port, src_ip, dst_ip, sport, dport);
   }
 }
 
@@ -212,7 +214,7 @@ void EventLogger::EmitNode(uint32_t node_id) {
 
 // One "EVENT link" per CONNECTED port of a node, emitted ONCE per link: only from the lower-id endpoint
 // (node_id < peer node id), so each QbbChannel prints a single line. Carries the link's bw (the port's
-// DataRate) + delay (the channel delay) -- the media params a decoder needs to rebuild the Netlist.
+// DataRate) + delay (the channel delay) -- the media params a parser needs to rebuild the Netlist.
 void EventLogger::EmitNodeLinks(uint32_t node_id) {
   Ptr<Node> node = NodeList::GetNode(node_id);
   if (!node) return;
