@@ -29,6 +29,8 @@ EventLogger::EventLogger() {
   m_enabled = (v != nullptr && std::strlen(v) > 0);
   const char* q = std::getenv("NS3_QUEUE_PROBE");
   m_queueProbe = (q != nullptr && std::strlen(q) > 0);
+  const char* c = std::getenv("NS3_CUT_PROBE");
+  m_cutProbe = (c != nullptr && std::strlen(c) > 0);
 }
 
 namespace {
@@ -107,6 +109,7 @@ void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
             << " pg=" << qp->m_pg
             << " active_n=" << group.size() << std::endl;
   DumpActiveSet(t, sub);
+  DumpFlowCut(t); // cut-side analog: per-(switch,flow) in/out payload for each open segment
   if (m_queueProbe && !m_queueProbeStarted) { // opt-in (NS3_QUEUE_PROBE): start the mid-flight queue sample
     m_queueProbeStarted = true;
     Simulator::Schedule(NanoSeconds(0), &EventLogger::PeriodicQueueDump, this);
@@ -115,13 +118,15 @@ void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
 
 void EventLogger::OnRateUpdate(Ptr<RdmaQueuePair> qp, const char* why) {
   if (!m_enabled) return;
+  int64_t t = Simulator::Now().GetNanoSeconds();
   std::cout << "EVENT rate_update"
-            << " t_ns=" << Simulator::Now().GetNanoSeconds()
+            << " t_ns=" << t
             << " flow=";
   EmitFlow(std::cout, qp);
   std::cout << " why=" << why
             << " rate_gbps=" << (qp->m_rate.GetBitRate() * 1e-9)
             << std::endl;
+  DumpFlowCut(t); // a CC rate change is a cut transition: snapshot every open segment's in/out payload
 }
 
 void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
@@ -143,6 +148,7 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
             << " size_bytes=" << qp->m_size
             << " active_n=" << group.size() << std::endl;
   DumpActiveSet(t, sub);
+  DumpFlowCut(t); // cut-side analog: per-(switch,flow) in/out payload for each still-open segment
   DumpAllQueues(t); // the in-fabric / queue half of the post-completion (next) state
   // The flow has now departed every hop: emit its per-hop switch_leave HERE (at completion,
   // not at program exit), then drop the entries so a recycled 4-tuple starts a fresh traversal.
@@ -165,27 +171,46 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
 // same-egress packets accumulate silently; a CHANGE of egress is a REROUTE --
 // close the old segment (switch_leave) and open a fresh one (switch_enter).
 void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t out_port,
-                                  uint64_t bytes, uint32_t src_ip, uint32_t dst_ip,
+                                  uint64_t bytes, uint64_t payload, uint32_t src_ip, uint32_t dst_ip,
                                   uint16_t sport, uint16_t dport) {
   if (!m_enabled) return;
   int64_t t = Simulator::Now().GetNanoSeconds();
   SwitchFlowKey key{switch_id, src_ip, dst_ip, sport, dport};
   auto it = m_switchFlows.find(key);
   if (it == m_switchFlows.end()) {
-    // First sighting: open the flow's segment at this switch.
-    m_switchFlows.emplace(key, SwitchFlowStat{out_port, t, t, bytes});
+    // First sighting: open the flow's segment (cut_in seeded, cut_out starts at 0 -- it accrues
+    // later when packets are actually transmitted out the egress via OnSwitchTransmit).
+    m_switchFlows.emplace(key, SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0});
     EmitSwitchEnter(t, switch_id, in_port, out_port, src_ip, dst_ip, sport, dport);
+    DumpFlowCut(t); // switch_enter is a cut transition: snapshot all open segments
   } else if (it->second.out_port == out_port) {
-    // Same egress: fold in this packet's timing + bytes (no per-packet line).
+    // Same egress: fold in this packet's timing + on-wire bytes + payload (no per-packet line).
     it->second.last_ns = t;
     it->second.bytes += bytes;
+    it->second.in_bytes += payload;
   } else {
     // REROUTE: egress changed -- close the old segment, open a new one.
     EmitSwitchLeave(switch_id, it->second.out_port, src_ip, dst_ip, sport, dport,
                     it->second.last_ns, it->second.bytes);
-    it->second = SwitchFlowStat{out_port, t, t, bytes};
+    it->second = SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0};
     EmitSwitchEnter(t, switch_id, in_port, out_port, src_ip, dst_ip, sport, dport);
+    DumpFlowCut(t); // switch_leave+switch_enter is a cut transition: snapshot all open segments
   }
+}
+
+// SWITCH-EGRESS-TRANSMIT hook. Called per DATA packet from SwitchNode::SwitchNotifyDequeue, at the
+// point a packet is dequeued from the BEgressQueue and about to TransmitStart -- i.e. it truly LEAVES
+// the switch. Adds the packet's PAYLOAD to the matching (switch, flow) OPEN segment's cut_out counter.
+// The segment MUST already exist (routing/OnSwitchForward opened it before the packet could be
+// enqueued+dequeued); if it was already closed (e.g. a straggler dequeued after qp_complete drained
+// the flow) there is no open cut to attribute to, so this is a no-op. Observe-only; no output.
+void EventLogger::OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64_t payload,
+                                   uint32_t src_ip, uint32_t dst_ip, uint16_t sport, uint16_t dport) {
+  if (!m_enabled) return;
+  SwitchFlowKey key{switch_id, src_ip, dst_ip, sport, dport};
+  auto it = m_switchFlows.find(key);
+  if (it == m_switchFlows.end()) return; // no open segment (closed/drained): nothing to attribute
+  it->second.out_bytes += payload;
 }
 
 // Emit the whole fabric: one "EVENT node" per node, then one "EVENT link" per link (each printed once).
@@ -291,6 +316,34 @@ void EventLogger::DumpActiveSet(int64_t t_ns, uint32_t subnetKey) {
               << " acked_bytes=" << qp->snd_una
               << " remaining_bytes=" << remaining
               << " rate_gbps=" << (qp->m_rate.GetBitRate() * 1e-9)
+              << std::endl;
+  }
+}
+
+// One "EVENT flow_cut" line per currently-OPEN (switch, flow) segment, carrying that flow's TWO
+// cumulative PAYLOAD counters through the switch so far -- in_bytes (cut_in: bytes that entered + were
+// routed) and out_bytes (cut_out: bytes actually transmitted out the egress) -- the boundary-observable
+// ("cut") analog of the sender-side "EVENT active" line (whose sent_bytes is L4 payload = snd_nxt).
+// Each counter sits next to the port it belongs to: ingress_port + in_bytes (the arrival side), then
+// egress_port + out_bytes (the departure side). m_switchFlows holds only OPEN segments (erased at
+// segment close) and is ordered
+// by (switch, 5-tuple), so a plain iteration is already deterministic. Observe-only: reads the map,
+// mutates nothing. Snapshotted at every cut transition (switch_enter/leave, qp_add, qp_complete,
+// rate_update). flow= is printed exactly like EmitSwitchEnter/EmitSwitchLeave.
+void EventLogger::DumpFlowCut(int64_t t_ns) {
+  if (!m_cutProbe) return; // opt-in gate (NS3_CUT_PROBE): off by default so goldens stay flow_cut-free
+  for (const auto& kv : m_switchFlows) {
+    const SwitchFlowKey& k = kv.first;
+    const SwitchFlowStat& s = kv.second;
+    std::cout << "EVENT flow_cut"
+              << " t_ns=" << t_ns
+              << " switch=" << k.switch_id
+              << " flow=" << Ipv4Address(k.src_ip) << ":" << k.sport
+              << "->" << Ipv4Address(k.dst_ip) << ":" << k.dport
+              << " ingress_port=" << s.in_port
+              << " in_bytes=" << s.in_bytes
+              << " egress_port=" << s.out_port
+              << " out_bytes=" << s.out_bytes
               << std::endl;
   }
 }

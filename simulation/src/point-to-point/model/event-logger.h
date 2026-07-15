@@ -53,9 +53,22 @@ public:
   // carrying both the ingress NetDevice in_port and the egress out_port); a
   // change of egress is a reroute (close old segment + open new); the segment
   // closes as "EVENT switch_leave" at qp_complete. Never per-packet spam.
+  // Carries BOTH byte counts of this forwarded packet: `bytes` = ON-WIRE size
+  // (p->GetSize(); feeds switch_leave's bytes=, unchanged) and `payload` = the L4
+  // PAYLOAD (p->GetSize() - ch.GetSerializedSize(), the receiver's identity in
+  // RdmaHw::ReceiveUdp; feeds flow_cut's in_bytes= == the cut_in count).
   void OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t out_port,
-                       uint64_t bytes, uint32_t src_ip, uint32_t dst_ip,
+                       uint64_t bytes, uint64_t payload, uint32_t src_ip, uint32_t dst_ip,
                        uint16_t sport, uint16_t dport);
+
+  // SWITCH-EGRESS-TRANSMIT hook: called from SwitchNode::SwitchNotifyDequeue when a DATA packet is
+  // dequeued from the BEgressQueue and handed to TransmitStart -- i.e. it TRULY LEAVES this switch
+  // on the wire (the routed-vs-actually-transmitted distinction: OnSwitchForward counts bytes that
+  // ENTERED + were routed; this counts bytes that DEPARTED). Adds the packet's PAYLOAD to the
+  // matching (switch, 5-tuple) OPEN segment's cut_out counter (flow_cut's out_bytes=). No-op if the
+  // segment is already closed (nothing open to attribute to). Observe-only; off => no-op.
+  void OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64_t payload,
+                        uint32_t src_ip, uint32_t dst_ip, uint16_t sport, uint16_t dport);
 
   // PFC hook: a QbbNetDevice's TX on (port, queue) PAUSES (it received a PFC PAUSE frame)
   // or RESUMES. Emitted ONLY on a real state TRANSITION -- no spam on the periodic
@@ -105,6 +118,17 @@ private:
   // sorted by 5-tuple, carrying sent/acked/remaining bytes + current rate.
   void DumpActiveSet(int64_t t_ns, uint32_t subnetKey);
 
+  // Emit one "EVENT flow_cut ..." line per currently-OPEN (switch, flow) segment, carrying that flow's
+  // TWO cumulative PAYLOAD counters through the switch so far -- each grouped next to the port it belongs
+  // to: ingress_port + in_bytes (cut_in = bytes that entered + were routed, SwitchFlowStat.in_port /
+  // .in_bytes) then egress_port + out_bytes (cut_out = bytes actually transmitted out the egress,
+  // SwitchFlowStat.out_port / .out_bytes) -- the boundary-observable ("cut") analog of the sender-side
+  // "EVENT active" line (whose sent_bytes is L4 payload = snd_nxt).
+  // Iterates m_switchFlows in its (switch, 5-tuple) key order, so output is deterministic. Observe-only
+  // (reads the map, mutates nothing). Snapshotted at every cut TRANSITION: switch_enter / switch_leave
+  // (in OnSwitchForward), qp_add, qp_complete, and each rate_update CC event.
+  void DumpFlowCut(int64_t t_ns);
+
   // Emit one "EVENT queue ..." line per (switch, egress port, priority-group) that has a NON-ZERO
   // egress backlog (an absent one == 0), for every SwitchNode (no subnet filter) -- the in-fabric /
   // queue half of a mid-flight state. The Rust parser/example picks the ports that matter. Called at
@@ -123,6 +147,7 @@ private:
   void PeriodicQueueDump();
   bool m_queueProbe = false;        // opt-in gate (NS3_QUEUE_PROBE): the 5us probe is heavy, off by default
   bool m_queueProbeStarted = false; // latched while a burst's probe loop is live; reset when it goes idle
+  bool m_cutProbe = false;          // opt-in gate (NS3_CUT_PROBE): the flow_cut byte-level dump, off by default (goldens stay clean)
 
   // Per (switch, flow) traversal state for OnSwitchForward. Key is the (switch,
   // 5-tuple) with NO egress port, so a flow that leaves an egress and later
@@ -142,14 +167,23 @@ private:
       return dport < o.dport;
     }
   };
-  // The flow's CURRENT segment at this switch: the egress it uses now + that
-  // segment's first/last sighting + bytes. A change in out_port is a REROUTE --
-  // close the old segment (switch_leave) and open a new one (switch_enter).
+  // The flow's CURRENT segment at this switch: the ingress it arrived on + the egress it
+  // uses now + that segment's first/last sighting + byte counters. A change in out_port is a
+  // REROUTE -- close the old segment (switch_leave) and open a new one (switch_enter).
+  //   in_port   = ingress NetDevice the segment arrived on (-> flow_cut ingress_port=; the
+  //               same value switch_enter prints as ingress_port=)
+  //   out_port  = egress the segment uses now              (-> flow_cut egress_port=)
+  //   bytes     = ON-WIRE bytes routed here (feeds switch_leave bytes=; kept as-is)
+  //   in_bytes  = PAYLOAD bytes routed here     (cut_in  -> flow_cut in_bytes=)
+  //   out_bytes = PAYLOAD bytes transmitted out (cut_out -> flow_cut out_bytes=)
   struct SwitchFlowStat {
     uint32_t out_port;
+    uint32_t in_port;
     int64_t  first_ns;
     int64_t  last_ns;
     uint64_t bytes;
+    uint64_t in_bytes;
+    uint64_t out_bytes;
   };
   std::map<SwitchFlowKey, SwitchFlowStat> m_switchFlows;
 };

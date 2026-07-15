@@ -10,6 +10,7 @@
 #include "qbb-net-device.h"
 #include "ppp-header.h"
 #include "ns3/int-header.h"
+#include "ns3/custom-header.h"
 #include "ns3/simulator.h"
 #include "event-logger.h"
 #include <cmath>
@@ -120,8 +121,11 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 		// SWITCH-SIDE flow instrumentation (observe-only; no-op unless NS3_EVENTS set).
 		// Report this DATA flow's traversal at (this switch, ingress port inDev, egress port idx) so
 		// post-processing can reconstruct transit paths + reroute bubbles. Data packets only.
+		// Pass BOTH the on-wire size (p->GetSize(), for switch_leave) and the L4 PAYLOAD
+		// (p->GetSize() - ch.GetSerializedSize(), the exact quantity RdmaHw::ReceiveUdp recovers, and
+		// the one snd_nxt/sent_bytes counts) so flow_cut's in_bytes is payload, not on-wire.
 		if (ch.l3Prot == 0x11)
-			EventLogger::Get().OnSwitchForward(GetId(), inDev, (uint32_t)idx, p->GetSize(), ch.sip, ch.dip, ch.udp.sport, ch.udp.dport);
+			EventLogger::Get().OnSwitchForward(GetId(), inDev, (uint32_t)idx, p->GetSize(), p->GetSize() - ch.GetSerializedSize(), ch.sip, ch.dip, ch.udp.sport, ch.udp.dport);
 
 		// determine the qIndex
 		uint32_t qIndex;
@@ -210,6 +214,19 @@ bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> pack
 void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p){
 	FlowIdTag t;
 	p->PeekPacketTag(t);
+	// SWITCH-EGRESS-TRANSMIT instrumentation (observe-only; no-op unless NS3_EVENTS set). A packet is
+	// leaving this switch's egress port ifIndex HERE (dequeued from the BEgressQueue; TransmitStart
+	// follows). For a DATA packet, attribute its L4 PAYLOAD to the (switch, flow) cut_out counter. The
+	// packet still carries all on-wire headers, so parse a CustomHeader exactly as the forward path does
+	// and recover payload = p->GetSize() - ch.GetSerializedSize() (RdmaHw::ReceiveUdp's identity).
+	if (EventLogger::Get().Enabled()){
+		CustomHeader chOut(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
+		chOut.getInt = 1;
+		p->PeekHeader(chOut);
+		if (chOut.l3Prot == 0x11)
+			EventLogger::Get().OnSwitchTransmit(GetId(), ifIndex, p->GetSize() - chOut.GetSerializedSize(),
+			                                    chOut.sip, chOut.dip, chOut.udp.sport, chOut.udp.dport);
+	}
 	if (qIndex != 0){
 		uint32_t inDev = t.GetFlowId();
 		m_mmu->RemoveFromIngressAdmission(inDev, qIndex, p->GetSize());
