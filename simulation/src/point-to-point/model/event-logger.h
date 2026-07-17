@@ -184,8 +184,29 @@ private:
     uint64_t bytes;
     uint64_t in_bytes;
     uint64_t out_bytes;
+    bool     departed; // its last byte has left the egress (switch_leave fired): kept (not erased) so a
+                       // lossy retransmit's forward folds in instead of re-opening a spurious segment;
+                       // skipped by flow_cut; erased at qp_complete.
   };
   std::map<SwitchFlowKey, SwitchFlowStat> m_switchFlows;
+
+  // Flow message size (payload = m_size), recorded at qp_add, looked up per egress packet in
+  // OnSwitchTransmit: when a segment's cut_out reaches it, that flow's LAST byte just left this
+  // egress -> emit switch_leave at the REAL exit (symmetric to switch_enter at the real entry),
+  // not deferred to qp_complete. Keyed by the flow 5-tuple (size is per-flow, not per-switch).
+  struct FlowSizeKey {
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t sport;
+    uint16_t dport;
+    bool operator<(const FlowSizeKey& o) const {
+      if (src_ip != o.src_ip) return src_ip < o.src_ip;
+      if (dst_ip != o.dst_ip) return dst_ip < o.dst_ip;
+      if (sport  != o.sport)  return sport  < o.sport;
+      return dport < o.dport;
+    }
+  };
+  std::map<FlowSizeKey, uint64_t> m_flowPayload;
 };
 
 } // namespace ns3
