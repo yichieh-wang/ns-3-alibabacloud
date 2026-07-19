@@ -103,6 +103,18 @@ public:
   // Netlist. Each setup path calls this ONCE after wiring: it reports the current fully-wired state.
   void DumpAllNodeInfo();
 
+  // Emit one "EVENT flow_cut ..." line per currently-OPEN (switch, flow) segment, carrying that flow's
+  // TWO cumulative PAYLOAD counters through the switch so far -- each grouped next to the port it belongs
+  // to: ingress_port + in_bytes (cut_in = bytes that entered + were routed, SwitchFlowStat.in_port /
+  // .in_bytes) then egress_port + out_bytes (cut_out = bytes actually transmitted out the egress,
+  // SwitchFlowStat.out_port / .out_bytes) -- the boundary-observable ("cut") analog of the sender-side
+  // "EVENT active" line (whose sent_bytes is L4 payload = snd_nxt). PUBLIC so control.h can snapshot a
+  // MID-RUN state on demand at a harness RUN_UNTIL pause, not only at the internal cut transitions below.
+  // Iterates m_switchFlows in its (switch, 5-tuple) key order, so output is deterministic. Observe-only.
+  // NS3_CUT_PROBE-gated. Snapshotted at every cut TRANSITION: switch_enter / switch_leave (in
+  // OnSwitchForward), qp_add, qp_complete, and each rate_update CC event -- plus on demand (control.h).
+  void DumpFlowCut(int64_t t_ns);
+
 private:
   EventLogger();
   ~EventLogger();
@@ -117,17 +129,6 @@ private:
   // Emit one "EVENT active ..." line per active QP in ONE subnet (the affected one),
   // sorted by 5-tuple, carrying sent/acked/remaining bytes + current rate.
   void DumpActiveSet(int64_t t_ns, uint32_t subnetKey);
-
-  // Emit one "EVENT flow_cut ..." line per currently-OPEN (switch, flow) segment, carrying that flow's
-  // TWO cumulative PAYLOAD counters through the switch so far -- each grouped next to the port it belongs
-  // to: ingress_port + in_bytes (cut_in = bytes that entered + were routed, SwitchFlowStat.in_port /
-  // .in_bytes) then egress_port + out_bytes (cut_out = bytes actually transmitted out the egress,
-  // SwitchFlowStat.out_port / .out_bytes) -- the boundary-observable ("cut") analog of the sender-side
-  // "EVENT active" line (whose sent_bytes is L4 payload = snd_nxt).
-  // Iterates m_switchFlows in its (switch, 5-tuple) key order, so output is deterministic. Observe-only
-  // (reads the map, mutates nothing). Snapshotted at every cut TRANSITION: switch_enter / switch_leave
-  // (in OnSwitchForward), qp_add, qp_complete, and each rate_update CC event.
-  void DumpFlowCut(int64_t t_ns);
 
   // Emit one "EVENT queue ..." line per (switch, egress port, priority-group) that has a NON-ZERO
   // egress backlog (an absent one == 0), for every SwitchNode (no subnet filter) -- the in-fabric /
