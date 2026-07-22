@@ -44,12 +44,12 @@ void EmitFlow(std::ostream& os, const Ptr<RdmaQueuePair>& qp) {
 uint32_t SubnetKey(const Ptr<RdmaQueuePair>& qp) {
   return qp->sip.Get() & 0xFFFF0000u;
 }
-// One "EVENT switch_enter" -- a flow opened a segment on (switch, egress port),
+// One "EVENT flow_inject" -- a flow opened a segment on (switch, egress port),
 // arriving on ingress NetDevice in_port (the boundary cut a parser anchors entry_port on).
 void EmitSwitchEnter(int64_t t, uint32_t sw, uint32_t in_port, uint32_t port,
                      uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
   // HEADS-UP: byte-level queue snapshot (per-pg backlog at entry) attaches here later (§4.4 byte-level phase).
-  std::cout << "EVENT switch_enter"
+  std::cout << "EVENT flow_inject"
             << " t_ns=" << t
             << " switch=" << sw
             << " ingress_port=" << in_port
@@ -58,13 +58,13 @@ void EmitSwitchEnter(int64_t t, uint32_t sw, uint32_t in_port, uint32_t port,
             << "->" << Ipv4Address(dip) << ":" << dport
             << std::endl;
 }
-// One "EVENT switch_leave" -- a flow closed a segment on (switch, egress port),
+// One "EVENT flow_eject_done" -- a flow closed a segment on (switch, egress port),
 // by reroute, qp_complete, or the exit flush.
 void EmitSwitchLeave(uint32_t sw, uint32_t port,
                      uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport,
                      int64_t leave_ns, uint64_t bytes) {
   // HEADS-UP: byte-level queue snapshot (per-pg backlog at leave) attaches here later (§4.4 byte-level phase).
-  std::cout << "EVENT switch_leave"
+  std::cout << "EVENT flow_eject_done"
             << " switch=" << sw
             << " egress_port=" << port
             << " flow=" << Ipv4Address(sip) << ":" << sport
@@ -160,7 +160,7 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
     const SwitchFlowKey& k = it->first;
     if (k.src_ip == sip && k.dst_ip == dip && k.sport == qp->sport && k.dport == qp->dport) {
       const SwitchFlowStat& s = it->second;
-      if (!s.departed) // never hit its egress-exit (lossy/straggler): fall back to the last-forward time
+      if (!s.eject_done) // never hit its egress-exit (lossy/straggler): fall back to the last-forward time
         EmitSwitchLeave(k.switch_id, s.out_port, k.src_ip, k.dst_ip, k.sport, k.dport,
                         s.last_ns, s.bytes);
       it = m_switchFlows.erase(it);
@@ -181,25 +181,45 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t
   if (!m_enabled) return;
   int64_t t = Simulator::Now().GetNanoSeconds();
   SwitchFlowKey key{switch_id, src_ip, dst_ip, sport, dport};
+  // Entry-cut crossing-END: the flow's LAST byte just entered this switch (cut_in reached its total
+  // payload) -- the fourth quarter of the cut-event symmetry (flow_inject = first byte in,
+  // flow_eject/_done = first/last byte out). The parser stamps `inflow_end_age` here.
+  auto check_inject_done = [&](SwitchFlowStat& s) {
+    if (s.inject_done) return;
+    auto sz = m_flowPayload.find(FlowSizeKey{src_ip, dst_ip, sport, dport});
+    if (sz == m_flowPayload.end() || s.in_bytes < sz->second) return;
+    s.inject_done = true;
+    std::cout << "EVENT flow_inject_done"
+              << " t_ns=" << t
+              << " switch=" << switch_id
+              << " ingress_port=" << s.in_port
+              << " flow=" << Ipv4Address(src_ip) << ":" << sport
+              << "->" << Ipv4Address(dst_ip) << ":" << dport
+              << std::endl;
+    DumpFlowCut(t); // a cut transition (the entry-side inflow closed): snapshot all open segments
+  };
   auto it = m_switchFlows.find(key);
   if (it == m_switchFlows.end()) {
     // First sighting: open the flow's segment (cut_in seeded, cut_out starts at 0 -- it accrues
     // later when packets are actually transmitted out the egress via OnSwitchTransmit).
-    m_switchFlows.emplace(key, SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0, false});
+    it = m_switchFlows.emplace(key, SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0, false, false}).first;
     EmitSwitchEnter(t, switch_id, in_port, out_port, src_ip, dst_ip, sport, dport);
-    DumpFlowCut(t); // switch_enter is a cut transition: snapshot all open segments
+    DumpFlowCut(t); // flow_inject is a cut transition: snapshot all open segments
+    check_inject_done(it->second); // a single-packet flow injects fully at first sighting
   } else if (it->second.out_port == out_port) {
     // Same egress: fold in this packet's timing + on-wire bytes + payload (no per-packet line).
     it->second.last_ns = t;
     it->second.bytes += bytes;
     it->second.in_bytes += payload;
+    check_inject_done(it->second);
   } else {
     // REROUTE: egress changed -- close the old segment, open a new one.
     EmitSwitchLeave(switch_id, it->second.out_port, src_ip, dst_ip, sport, dport,
                     it->second.last_ns, it->second.bytes);
-    it->second = SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0, false};
+    it->second = SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0, false, false};
     EmitSwitchEnter(t, switch_id, in_port, out_port, src_ip, dst_ip, sport, dport);
-    DumpFlowCut(t); // switch_leave+switch_enter is a cut transition: snapshot all open segments
+    DumpFlowCut(t); // flow_eject_done+flow_inject is a cut transition: snapshot all open segments
+    check_inject_done(it->second);
   }
 }
 
@@ -215,19 +235,35 @@ void EventLogger::OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64
   SwitchFlowKey key{switch_id, src_ip, dst_ip, sport, dport};
   auto it = m_switchFlows.find(key);
   if (it == m_switchFlows.end()) return; // no open segment (closed/drained): nothing to attribute
+  bool first_out = (it->second.out_bytes == 0);
   it->second.out_bytes += payload;
+  if (first_out) {
+    // Exit-cut crossing-START: the flow's FIRST byte just left this egress -- the missing quarter of
+    // the cut-event symmetry (switch_enter = first byte in, switch_leave = last byte out). The parser
+    // reveals the flow's exit port HERE (observed, never predicted) and emits the Start crossing. A
+    // reroute reopens the segment with out_bytes = 0, so the new egress re-reveals -- correct.
+    int64_t t = Simulator::Now().GetNanoSeconds();
+    std::cout << "EVENT flow_eject"
+              << " t_ns=" << t
+              << " switch=" << switch_id
+              << " egress_port=" << out_port
+              << " flow=" << Ipv4Address(src_ip) << ":" << sport
+              << "->" << Ipv4Address(dst_ip) << ":" << dport
+              << std::endl;
+    DumpFlowCut(t); // a cut transition: snapshot so the reveal-instant state reads fresh byte counters
+  }
 
   // Real EGRESS-EXIT: once cut_out has reached the flow's total payload, this flow's LAST byte has just
   // left this egress -- it has physically crossed the exit cut. Close the segment HERE (leave_ns = now),
   // symmetric to switch_enter at the real entry, instead of deferring to qp_complete (the sender ACK,
   // ~RTT later). Drop the segment BEFORE the snapshot so flow_cut shows the SURVIVORS at the real exit.
   auto sz = m_flowPayload.find(FlowSizeKey{src_ip, dst_ip, sport, dport});
-  if (sz != m_flowPayload.end() && !it->second.departed && it->second.out_bytes >= sz->second) {
+  if (sz != m_flowPayload.end() && !it->second.eject_done && it->second.out_bytes >= sz->second) {
     int64_t t = Simulator::Now().GetNanoSeconds();
     EmitSwitchLeave(switch_id, it->second.out_port, src_ip, dst_ip, sport, dport, t, it->second.bytes);
-    it->second.departed = true; // mark departed but KEEP the segment: a lossy retransmit's later forward
+    it->second.eject_done = true; // mark eject_done but KEEP the segment: a lossy retransmit's later forward
                                 // then folds in via find() instead of re-opening a spurious segment.
-    DumpFlowCut(t);             // snapshot the SURVIVORS at the real exit (departed segments are skipped)
+    DumpFlowCut(t);             // snapshot the SURVIVORS at the real exit (eject_done segments are skipped)
   }
 }
 
@@ -353,7 +389,7 @@ void EventLogger::DumpFlowCut(int64_t t_ns) {
   for (const auto& kv : m_switchFlows) {
     const SwitchFlowKey& k = kv.first;
     const SwitchFlowStat& s = kv.second;
-    if (s.departed) continue; // already crossed the exit cut (switch_leave fired): not in the cut now
+    if (s.eject_done) continue; // already crossed the exit cut (switch_leave fired): not in the cut now
     std::cout << "EVENT flow_cut"
               << " t_ns=" << t_ns
               << " switch=" << k.switch_id

@@ -185,7 +185,8 @@ private:
     uint64_t bytes;
     uint64_t in_bytes;
     uint64_t out_bytes;
-    bool     departed; // its last byte has left the egress (switch_leave fired): kept (not erased) so a
+    bool     inject_done; // its last byte has entered (flow_inject_done fired): dedups the emit.
+    bool     eject_done; // its last byte has left the egress (flow_eject_done fired): kept (not erased) so a
                        // lossy retransmit's forward folds in instead of re-opening a spurious segment;
                        // skipped by flow_cut; erased at qp_complete.
   };
