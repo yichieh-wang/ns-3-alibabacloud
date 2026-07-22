@@ -125,7 +125,7 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 		// (p->GetSize() - ch.GetSerializedSize(), the exact quantity RdmaHw::ReceiveUdp recovers, and
 		// the one snd_nxt/sent_bytes counts) so flow_cut's in_bytes is payload, not on-wire.
 		if (ch.l3Prot == 0x11)
-			EventLogger::Get().OnSwitchForward(GetId(), inDev, (uint32_t)idx, p->GetSize(), p->GetSize() - ch.GetSerializedSize(), ch.sip, ch.dip, ch.udp.sport, ch.udp.dport);
+			EventLogger::Get().OnSwitchForward(GetId(), inDev, (uint32_t)idx, (uint8_t)ch.udp.pg, p->GetSize(), p->GetSize() - ch.GetSerializedSize(), ch.sip, ch.dip, ch.udp.sport, ch.udp.dport);
 
 		// determine the qIndex
 		uint32_t qIndex;

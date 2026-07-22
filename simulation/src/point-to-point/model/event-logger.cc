@@ -46,7 +46,7 @@ uint32_t SubnetKey(const Ptr<RdmaQueuePair>& qp) {
 }
 // One "EVENT flow_inject" -- a flow opened a segment on (switch, egress port),
 // arriving on ingress NetDevice in_port (the boundary cut a parser anchors entry_port on).
-void EmitSwitchEnter(int64_t t, uint32_t sw, uint32_t in_port, uint32_t port,
+void EmitSwitchEnter(int64_t t, uint32_t sw, uint32_t in_port, uint32_t port, uint8_t pg, uint64_t size,
                      uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
   // HEADS-UP: byte-level queue snapshot (per-pg backlog at entry) attaches here later (§4.4 byte-level phase).
   std::cout << "EVENT flow_inject"
@@ -54,13 +54,15 @@ void EmitSwitchEnter(int64_t t, uint32_t sw, uint32_t in_port, uint32_t port,
             << " switch=" << sw
             << " ingress_port=" << in_port
             << " egress_port=" << port
-            << " flow=" << Ipv4Address(sip) << ":" << sport
+            << " pg=" << (uint32_t)pg;
+  if (size) std::cout << " size_bytes=" << size;
+  std::cout << " flow=" << Ipv4Address(sip) << ":" << sport
             << "->" << Ipv4Address(dip) << ":" << dport
             << std::endl;
 }
 // One "EVENT flow_eject_done" -- a flow closed a segment on (switch, egress port),
 // by reroute, qp_complete, or the exit flush.
-void EmitSwitchLeave(uint32_t sw, uint32_t port,
+void EmitSwitchLeave(uint32_t sw, uint32_t port, uint64_t size,
                      uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport,
                      int64_t leave_ns, uint64_t bytes) {
   // HEADS-UP: byte-level queue snapshot (per-pg backlog at leave) attaches here later (§4.4 byte-level phase).
@@ -70,8 +72,9 @@ void EmitSwitchLeave(uint32_t sw, uint32_t port,
             << " flow=" << Ipv4Address(sip) << ":" << sport
             << "->" << Ipv4Address(dip) << ":" << dport
             << " leave_ns=" << leave_ns
-            << " bytes=" << bytes
-            << std::endl;
+            << " bytes=" << bytes;
+  if (size) std::cout << " size_bytes=" << size;
+  std::cout << std::endl;
 }
 // The cca string for an RdmaHw CcMode (the config's cca<->CcMode mapping, DCQCN == 1).
 const char* CcaName(uint32_t ccMode) {
@@ -88,8 +91,9 @@ EventLogger::~EventLogger() {
   for (const auto& kv : m_switchFlows) {
     const SwitchFlowKey& k = kv.first;
     const SwitchFlowStat& s = kv.second;
-    EmitSwitchLeave(k.switch_id, s.out_port, k.src_ip, k.dst_ip, k.sport, k.dport,
-                    s.last_ns, s.bytes);
+    auto sz = m_flowPayload.find(FlowSizeKey{k.src_ip, k.dst_ip, k.sport, k.dport});
+    EmitSwitchLeave(k.switch_id, s.out_port, (sz == m_flowPayload.end()) ? 0 : sz->second,
+                    k.src_ip, k.dst_ip, k.sport, k.dport, s.last_ns, s.bytes);
   }
 }
 
@@ -131,6 +135,51 @@ void EventLogger::OnRateUpdate(Ptr<RdmaQueuePair> qp, const char* why) {
   DumpFlowCut(t); // a CC rate change is a cut transition: snapshot every open segment's in/out payload
 }
 
+void EventLogger::OnHostSend(uint32_t node_id, Ptr<RdmaQueuePair> qp) {
+  if (!m_enabled) return;
+  uint8_t& mark = m_hostSendMark[FlowSizeKey{qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport}];
+  uint64_t sent = qp->snd_nxt; // cumulative payload handed to the NIC (rewinds on go-back-N: marks dedup)
+  int64_t t = Simulator::Now().GetNanoSeconds();
+  if (!(mark & 1) && sent > 0) {
+    mark |= 1;
+    std::cout << "EVENT host_send t_ns=" << t << " node=" << node_id
+              << " pg=" << (uint32_t)qp->m_pg << " size_bytes=" << qp->m_size << " flow=";
+    EmitFlow(std::cout, qp);
+    std::cout << std::endl;
+  }
+  if (!(mark & 2) && sent >= qp->m_size) {
+    mark |= 2;
+    std::cout << "EVENT host_send_done t_ns=" << t << " node=" << node_id
+              << " size_bytes=" << qp->m_size << " flow=";
+    EmitFlow(std::cout, qp);
+    std::cout << std::endl;
+  }
+}
+
+void EventLogger::OnHostRecv(uint32_t node_id, uint8_t pg, uint32_t sip, uint32_t dip, uint16_t sport,
+                             uint16_t dport, uint64_t received) {
+  if (!m_enabled) return;
+  FlowSizeKey key{sip, dip, sport, dport};
+  uint8_t& mark = m_hostRecvMark[key];
+  int64_t t = Simulator::Now().GetNanoSeconds();
+  auto sz = m_flowPayload.find(key);
+  uint64_t size = (sz == m_flowPayload.end()) ? 0 : sz->second; // 0 = unknown -> field omitted
+  if (!(mark & 1) && received > 0) {
+    mark |= 1;
+    std::cout << "EVENT host_recv t_ns=" << t << " node=" << node_id << " pg=" << (uint32_t)pg;
+    if (size) std::cout << " size_bytes=" << size;
+    std::cout << " flow=" << Ipv4Address(sip) << ":" << sport
+              << "->" << Ipv4Address(dip) << ":" << dport << std::endl;
+  }
+  if (!(mark & 2) && size && received >= size) {
+    mark |= 2;
+    std::cout << "EVENT host_recv_done t_ns=" << t << " node=" << node_id
+              << " size_bytes=" << size
+              << " flow=" << Ipv4Address(sip) << ":" << sport
+              << "->" << Ipv4Address(dip) << ":" << dport << std::endl;
+  }
+}
+
 void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
   if (!m_enabled) return;
   int64_t t = Simulator::Now().GetNanoSeconds();
@@ -161,38 +210,43 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
     if (k.src_ip == sip && k.dst_ip == dip && k.sport == qp->sport && k.dport == qp->dport) {
       const SwitchFlowStat& s = it->second;
       if (!s.eject_done) // never hit its egress-exit (lossy/straggler): fall back to the last-forward time
-        EmitSwitchLeave(k.switch_id, s.out_port, k.src_ip, k.dst_ip, k.sport, k.dport,
+        EmitSwitchLeave(k.switch_id, s.out_port, qp->m_size, k.src_ip, k.dst_ip, k.sport, k.dport,
                         s.last_ns, s.bytes);
       it = m_switchFlows.erase(it);
     } else {
       ++it;
     }
   }
-  m_flowPayload.erase(FlowSizeKey{sip, dip, qp->sport, qp->dport}); // the flow is done: drop its size
+  FlowSizeKey fkey{sip, dip, qp->sport, qp->dport};
+  m_flowPayload.erase(fkey); // the flow is done: drop its size
+  m_hostSendMark.erase(fkey);
+  m_hostRecvMark.erase(fkey);
 }
 
 // SWITCH-SIDE traversal hook. Called per data packet from SwitchNode::SendToDev.
 // Keyed by (switch, flow): the first sighting opens a segment (switch_enter);
 // same-egress packets accumulate silently; a CHANGE of egress is a REROUTE --
 // close the old segment (switch_leave) and open a fresh one (switch_enter).
-void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t out_port,
+void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t out_port, uint8_t pg,
                                   uint64_t bytes, uint64_t payload, uint32_t src_ip, uint32_t dst_ip,
                                   uint16_t sport, uint16_t dport) {
   if (!m_enabled) return;
   int64_t t = Simulator::Now().GetNanoSeconds();
   SwitchFlowKey key{switch_id, src_ip, dst_ip, sport, dport};
+  auto sz = m_flowPayload.find(FlowSizeKey{src_ip, dst_ip, sport, dport});
+  uint64_t size = (sz == m_flowPayload.end()) ? 0 : sz->second; // 0 = unknown -> field omitted
   // Entry-cut crossing-END: the flow's LAST byte just entered this switch (cut_in reached its total
   // payload) -- the fourth quarter of the cut-event symmetry (flow_inject = first byte in,
   // flow_eject/_done = first/last byte out). The parser stamps `inflow_end_age` here.
   auto check_inject_done = [&](SwitchFlowStat& s) {
     if (s.inject_done) return;
-    auto sz = m_flowPayload.find(FlowSizeKey{src_ip, dst_ip, sport, dport});
     if (sz == m_flowPayload.end() || s.in_bytes < sz->second) return;
     s.inject_done = true;
     std::cout << "EVENT flow_inject_done"
               << " t_ns=" << t
               << " switch=" << switch_id
               << " ingress_port=" << s.in_port
+              << " size_bytes=" << sz->second
               << " flow=" << Ipv4Address(src_ip) << ":" << sport
               << "->" << Ipv4Address(dst_ip) << ":" << dport
               << std::endl;
@@ -202,8 +256,8 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t
   if (it == m_switchFlows.end()) {
     // First sighting: open the flow's segment (cut_in seeded, cut_out starts at 0 -- it accrues
     // later when packets are actually transmitted out the egress via OnSwitchTransmit).
-    it = m_switchFlows.emplace(key, SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0, false, false}).first;
-    EmitSwitchEnter(t, switch_id, in_port, out_port, src_ip, dst_ip, sport, dport);
+    it = m_switchFlows.emplace(key, SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0, pg, false, false}).first;
+    EmitSwitchEnter(t, switch_id, in_port, out_port, pg, size, src_ip, dst_ip, sport, dport);
     DumpFlowCut(t); // flow_inject is a cut transition: snapshot all open segments
     check_inject_done(it->second); // a single-packet flow injects fully at first sighting
   } else if (it->second.out_port == out_port) {
@@ -214,10 +268,10 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t
     check_inject_done(it->second);
   } else {
     // REROUTE: egress changed -- close the old segment, open a new one.
-    EmitSwitchLeave(switch_id, it->second.out_port, src_ip, dst_ip, sport, dport,
+    EmitSwitchLeave(switch_id, it->second.out_port, size, src_ip, dst_ip, sport, dport,
                     it->second.last_ns, it->second.bytes);
-    it->second = SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0, false, false};
-    EmitSwitchEnter(t, switch_id, in_port, out_port, src_ip, dst_ip, sport, dport);
+    it->second = SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0, pg, false, false};
+    EmitSwitchEnter(t, switch_id, in_port, out_port, pg, size, src_ip, dst_ip, sport, dport);
     DumpFlowCut(t); // flow_eject_done+flow_inject is a cut transition: snapshot all open segments
     check_inject_done(it->second);
   }
@@ -235,6 +289,8 @@ void EventLogger::OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64
   SwitchFlowKey key{switch_id, src_ip, dst_ip, sport, dport};
   auto it = m_switchFlows.find(key);
   if (it == m_switchFlows.end()) return; // no open segment (closed/drained): nothing to attribute
+  auto sz = m_flowPayload.find(FlowSizeKey{src_ip, dst_ip, sport, dport});
+  uint64_t size = (sz == m_flowPayload.end()) ? 0 : sz->second; // 0 = unknown -> field omitted
   bool first_out = (it->second.out_bytes == 0);
   it->second.out_bytes += payload;
   if (first_out) {
@@ -247,7 +303,9 @@ void EventLogger::OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64
               << " t_ns=" << t
               << " switch=" << switch_id
               << " egress_port=" << out_port
-              << " flow=" << Ipv4Address(src_ip) << ":" << sport
+              << " pg=" << (uint32_t)it->second.pg;
+    if (size) std::cout << " size_bytes=" << size;
+    std::cout << " flow=" << Ipv4Address(src_ip) << ":" << sport
               << "->" << Ipv4Address(dst_ip) << ":" << dport
               << std::endl;
     DumpFlowCut(t); // a cut transition: snapshot so the reveal-instant state reads fresh byte counters
@@ -257,10 +315,9 @@ void EventLogger::OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64
   // left this egress -- it has physically crossed the exit cut. Close the segment HERE (leave_ns = now),
   // symmetric to switch_enter at the real entry, instead of deferring to qp_complete (the sender ACK,
   // ~RTT later). Drop the segment BEFORE the snapshot so flow_cut shows the SURVIVORS at the real exit.
-  auto sz = m_flowPayload.find(FlowSizeKey{src_ip, dst_ip, sport, dport});
   if (sz != m_flowPayload.end() && !it->second.eject_done && it->second.out_bytes >= sz->second) {
     int64_t t = Simulator::Now().GetNanoSeconds();
-    EmitSwitchLeave(switch_id, it->second.out_port, src_ip, dst_ip, sport, dport, t, it->second.bytes);
+    EmitSwitchLeave(switch_id, it->second.out_port, size, src_ip, dst_ip, sport, dport, t, it->second.bytes);
     it->second.eject_done = true; // mark eject_done but KEEP the segment: a lossy retransmit's later forward
                                 // then folds in via find() instead of re-opening a spurious segment.
     DumpFlowCut(t);             // snapshot the SURVIVORS at the real exit (eject_done segments are skipped)

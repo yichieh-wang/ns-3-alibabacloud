@@ -40,6 +40,13 @@ public:
   // "change_rate", "mlx_cnp", "mlx_dec", "mlx_fastrec", "mlx_actinc",
   // "mlx_hyperinc", "timely", "dctcp_dec", "dctcp_inc").
   void OnRateUpdate(Ptr<RdmaQueuePair> qp, const char* why);
+
+  // Host-side quadrant (the NIC cuts, one link outside the switch cuts): first/last payload byte OUT
+  // of the sender (host_send / host_send_done) and IN at the receiver (host_recv / host_recv_done).
+  // Called per packet; the logger derives the four endpoint events from the cumulative counters.
+  void OnHostSend(uint32_t node_id, Ptr<RdmaQueuePair> qp);
+  void OnHostRecv(uint32_t node_id, uint8_t pg, uint32_t sip, uint32_t dip, uint16_t sport,
+                  uint16_t dport, uint64_t received);
   void OnQpComplete(Ptr<RdmaQueuePair> qp);
 
   // SWITCH-SIDE hook (design point (d)): called from SwitchNode::SendToDev once a
@@ -57,7 +64,7 @@ public:
   // (p->GetSize(); feeds switch_leave's bytes=, unchanged) and `payload` = the L4
   // PAYLOAD (p->GetSize() - ch.GetSerializedSize(), the receiver's identity in
   // RdmaHw::ReceiveUdp; feeds flow_cut's in_bytes= == the cut_in count).
-  void OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t out_port,
+  void OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t out_port, uint8_t pg,
                        uint64_t bytes, uint64_t payload, uint32_t src_ip, uint32_t dst_ip,
                        uint16_t sport, uint16_t dport);
 
@@ -185,6 +192,7 @@ private:
     uint64_t bytes;
     uint64_t in_bytes;
     uint64_t out_bytes;
+    uint8_t  pg;          // the flow's priority group, told at the segment's open (flow_inject).
     bool     inject_done; // its last byte has entered (flow_inject_done fired): dedups the emit.
     bool     eject_done; // its last byte has left the egress (flow_eject_done fired): kept (not erased) so a
                        // lossy retransmit's forward folds in instead of re-opening a spurious segment;
@@ -209,6 +217,10 @@ private:
     }
   };
   std::map<FlowSizeKey, uint64_t> m_flowPayload;
+  // 2-bit dedup marks for the host-quadrant emits (bit0 = start announced, bit1 = done announced);
+  // erased with m_flowPayload at qp_complete.
+  std::map<FlowSizeKey, uint8_t> m_hostSendMark;
+  std::map<FlowSizeKey, uint8_t> m_hostRecvMark;
 };
 
 } // namespace ns3
