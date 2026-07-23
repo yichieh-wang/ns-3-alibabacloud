@@ -429,7 +429,8 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	rxQp->m_milestone_rx = m_ack_interval;
 
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
-	EventLogger::Get().OnHostRecv(m_node->GetId(), (uint8_t)ch.udp.pg, ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
+	EventLogger::Get().OnHostRecv(m_node->GetId(), m_nic[GetNicIdxOfRxQp(rxQp)].dev->GetIfIndex(),
+	                              (uint8_t)ch.udp.pg, ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
 	                              rxQp->ReceiverNextExpectedSeq); // host-quadrant: host_recv/_done
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		qbbHeader seqh;
@@ -724,7 +725,7 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 
 	// update state
 	qp->snd_nxt += payload_size;
-	EventLogger::Get().OnHostSend(m_node->GetId(), qp); // host-quadrant: derives host_send/_done from snd_nxt
+	EventLogger::Get().OnHostSend(m_node->GetId(), m_nic[GetNicIdxOfQp(qp)].dev->GetIfIndex(), qp); // host-quadrant: derives host_send/_done from snd_nxt
 	// std::cout << "current snd_nxt is: " << qp->snd_nxt << ", the window is: " << qp->m_win << std::endl;
 	qp->m_ipid++;
 

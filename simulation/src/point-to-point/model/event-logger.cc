@@ -31,6 +31,8 @@ EventLogger::EventLogger() {
   m_queueProbe = (q != nullptr && std::strlen(q) > 0);
   const char* c = std::getenv("NS3_CUT_PROBE");
   m_cutProbe = (c != nullptr && std::strlen(c) > 0);
+  const char* hp = std::getenv("NS3_HOST_PORT_EVENTS");
+  m_hostPortEvents = (hp != nullptr && std::strlen(hp) > 0);
 }
 
 namespace {
@@ -135,7 +137,7 @@ void EventLogger::OnRateUpdate(Ptr<RdmaQueuePair> qp, const char* why) {
   DumpFlowCut(t); // a CC rate change is a cut transition: snapshot every open segment's in/out payload
 }
 
-void EventLogger::OnHostSend(uint32_t node_id, Ptr<RdmaQueuePair> qp) {
+void EventLogger::OnHostSend(uint32_t node_id, uint32_t port, Ptr<RdmaQueuePair> qp) {
   if (!m_enabled) return;
   uint8_t& mark = m_hostSendMark[FlowSizeKey{qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport}];
   uint64_t sent = qp->snd_nxt; // cumulative payload handed to the NIC (rewinds on go-back-N: marks dedup)
@@ -154,9 +156,36 @@ void EventLogger::OnHostSend(uint32_t node_id, Ptr<RdmaQueuePair> qp) {
     EmitFlow(std::cout, qp);
     std::cout << std::endl;
   }
+  if (!m_hostPortEvents) return;
+  // HOST-PORT quadrant (NS3_HOST_PORT_EVENTS), NoC convention: a terminal SENDING is INJECTING
+  // into the network -- flow_inject/_done at the source NIC, cumulative progress (snd_nxt) in
+  // in_bytes. (Terminals speak the network frame; switches keep their per-node segment frame.)
+  // The segment closes at its last byte; a TRUNCATED sender's leftover still falls to the
+  // destructor's eject_done flush -- the wrong family for a source, a known truncated-trace wart.
+  SwitchFlowKey key{node_id, qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport};
+  auto it = m_switchFlows.find(key);
+  if (it == m_switchFlows.end()) {
+    if (sent == 0) return;
+    it = m_switchFlows.emplace(key, SwitchFlowStat{port, port, t, t, 0, 0, 0, qp->m_pg, false, false}).first;
+    std::cout << "EVENT flow_inject t_ns=" << t << " switch=" << node_id << " ingress_port=" << port
+              << " egress_port=" << port << " pg=" << (uint32_t)qp->m_pg << " size_bytes=" << qp->m_size << " flow=";
+    EmitFlow(std::cout, qp);
+    std::cout << std::endl;
+    DumpFlowCut(t);
+  }
+  it->second.last_ns = t;
+  it->second.in_bytes = sent;
+  if (sent >= qp->m_size) {
+    std::cout << "EVENT flow_inject_done t_ns=" << t << " switch=" << node_id
+              << " ingress_port=" << port << " size_bytes=" << qp->m_size << " flow=";
+    EmitFlow(std::cout, qp);
+    std::cout << std::endl;
+    m_switchFlows.erase(it);
+    DumpFlowCut(t);
+  }
 }
 
-void EventLogger::OnHostRecv(uint32_t node_id, uint8_t pg, uint32_t sip, uint32_t dip, uint16_t sport,
+void EventLogger::OnHostRecv(uint32_t node_id, uint32_t port, uint8_t pg, uint32_t sip, uint32_t dip, uint16_t sport,
                              uint16_t dport, uint64_t received) {
   if (!m_enabled) return;
   FlowSizeKey key{sip, dip, sport, dport};
@@ -177,6 +206,30 @@ void EventLogger::OnHostRecv(uint32_t node_id, uint8_t pg, uint32_t sip, uint32_
               << " size_bytes=" << size
               << " flow=" << Ipv4Address(sip) << ":" << sport
               << "->" << Ipv4Address(dip) << ":" << dport << std::endl;
+  }
+  if (!m_hostPortEvents) return;
+  // HOST-PORT quadrant (NS3_HOST_PORT_EVENTS), NoC convention: a terminal RECEIVING is EJECTING
+  // from the network (bytes leave the fabric into the host's memory) -- flow_eject/_done at the
+  // sink NIC, cumulative progress in out_bytes. A truncated receiver's leftover falls to the
+  // destructor's eject_done flush, which for a sink is the RIGHT family.
+  SwitchFlowKey skey{node_id, sip, dip, sport, dport};
+  auto it = m_switchFlows.find(skey);
+  if (it == m_switchFlows.end()) {
+    if (received == 0) return;
+    it = m_switchFlows.emplace(skey, SwitchFlowStat{port, port, t, t, 0, 0, 0, pg, false, false}).first;
+    std::cout << "EVENT flow_eject t_ns=" << t << " switch=" << node_id << " egress_port=" << port
+              << " pg=" << (uint32_t)pg;
+    if (size) std::cout << " size_bytes=" << size;
+    std::cout << " flow=" << Ipv4Address(sip) << ":" << sport
+              << "->" << Ipv4Address(dip) << ":" << dport << std::endl;
+    DumpFlowCut(t);
+  }
+  it->second.last_ns = t;
+  it->second.out_bytes = received;
+  if (size && received >= size) {
+    EmitSwitchLeave(node_id, port, size, sip, dip, sport, dport, t, received);
+    m_switchFlows.erase(it);
+    DumpFlowCut(t);
   }
 }
 

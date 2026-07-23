@@ -44,8 +44,8 @@ public:
   // Host-side quadrant (the NIC cuts, one link outside the switch cuts): first/last payload byte OUT
   // of the sender (host_send / host_send_done) and IN at the receiver (host_recv / host_recv_done).
   // Called per packet; the logger derives the four endpoint events from the cumulative counters.
-  void OnHostSend(uint32_t node_id, Ptr<RdmaQueuePair> qp);
-  void OnHostRecv(uint32_t node_id, uint8_t pg, uint32_t sip, uint32_t dip, uint16_t sport,
+  void OnHostSend(uint32_t node_id, uint32_t port, Ptr<RdmaQueuePair> qp);
+  void OnHostRecv(uint32_t node_id, uint32_t port, uint8_t pg, uint32_t sip, uint32_t dip, uint16_t sport,
                   uint16_t dport, uint64_t received);
   void OnQpComplete(Ptr<RdmaQueuePair> qp);
 
@@ -126,6 +126,13 @@ private:
   EventLogger();
   ~EventLogger();
   bool m_enabled = false;
+  // NS3_HOST_PORT_EVENTS: host NIC ports speak the switch-port event family under the NoC
+  // convention -- a terminal SENDING is INJECTING into the network (flow_inject/_done, progress
+  // in in_bytes), RECEIVING is EJECTING from it (flow_eject/_done, progress in out_bytes), plus
+  // flow_cut counters. Terminals speak the network frame; switches keep their per-node segment
+  // frame. Gated until the parser's host-machine attribution lands (emitting today would
+  // double-feed the mirror-based collectors).
+  bool m_hostPortEvents = false;
   // Active flows (QPs) grouped BY SUBNET, maintained by OnQpAdded / OnQpComplete.
   // The cache keys on a SUBNET's active set, not a global one (cache-design §7.5),
   // so we partition. Subnet key = the source IP's /16 prefix (our 11.<leaf>.<host>.1
