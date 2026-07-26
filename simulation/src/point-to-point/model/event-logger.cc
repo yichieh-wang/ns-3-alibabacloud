@@ -1,4 +1,5 @@
 #include "event-logger.h"
+#include <mutex>
 #include "switch-node.h"
 #include "point-to-point-net-device.h"
 #include "qbb-channel.h"
@@ -24,6 +25,17 @@ EventLogger& EventLogger::Get() {
 }
 
 // Read the gate once at construction so the hot path is a single bool test.
+// UNISON (mtp) runs these emitters from MANY threads: the ONE process-wide lock (shared via
+// EmitLock() with every other stdout emitter, e.g. a scratch program's FLOW_COMPLETE) makes
+// each logical trace line AND its shared cut-state mutation (m_hostSendMark / m_switchFlows /
+// ...) atomic. Recursive because emitters call DumpFlowCut/DumpActiveSet inline. Uncontended
+// cost under the sequential kernel is nanoseconds.
+std::recursive_mutex& EventLogger::EmitLock() {
+  static std::recursive_mutex m;
+  return m;
+}
+#define EMIT_LOCK std::lock_guard<std::recursive_mutex> emit_guard(EventLogger::EmitLock())
+
 EventLogger::EventLogger() {
   const char* v = std::getenv("NS3_EVENTS");
   m_enabled = (v != nullptr && std::strlen(v) > 0);
@@ -89,6 +101,7 @@ const char* CcaName(uint32_t ccMode) {
 // fallback); flush it as a final switch_leave. The map is ordered so output is
 // deterministic. No-op when off (the map is never populated when disabled).
 EventLogger::~EventLogger() {
+  EMIT_LOCK;
   if (!m_enabled) return;
   for (const auto& kv : m_switchFlows) {
     const SwitchFlowKey& k = kv.first;
@@ -100,6 +113,7 @@ EventLogger::~EventLogger() {
 }
 
 void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
+  EMIT_LOCK;
   if (!m_enabled) return;
   uint32_t sub = SubnetKey(qp);
   std::vector<Ptr<RdmaQueuePair>>& group = m_activeBySubnet[sub];
@@ -125,6 +139,7 @@ void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
 }
 
 void EventLogger::OnRateUpdate(Ptr<RdmaQueuePair> qp, const char* why) {
+  EMIT_LOCK;
   if (!m_enabled) return;
   int64_t t = Simulator::Now().GetNanoSeconds();
   std::cout << "EVENT rate_update"
@@ -138,6 +153,7 @@ void EventLogger::OnRateUpdate(Ptr<RdmaQueuePair> qp, const char* why) {
 }
 
 void EventLogger::OnHostSend(uint32_t node_id, uint32_t port, Ptr<RdmaQueuePair> qp) {
+  EMIT_LOCK;
   if (!m_enabled) return;
   uint8_t& mark = m_hostSendMark[FlowSizeKey{qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport}];
   uint64_t sent = qp->snd_nxt; // cumulative payload handed to the NIC (rewinds on go-back-N: marks dedup)
@@ -166,7 +182,7 @@ void EventLogger::OnHostSend(uint32_t node_id, uint32_t port, Ptr<RdmaQueuePair>
   auto it = m_switchFlows.find(key);
   if (it == m_switchFlows.end()) {
     if (sent == 0) return;
-    it = m_switchFlows.emplace(key, SwitchFlowStat{port, port, t, t, 0, 0, 0, qp->m_pg, false, false}).first;
+    it = m_switchFlows.emplace(key, SwitchFlowStat{port, port, t, t, 0, 0, 0, (uint8_t)qp->m_pg, false, false}).first;
     std::cout << "EVENT flow_inject t_ns=" << t << " switch=" << node_id << " ingress_port=" << port
               << " egress_port=" << port << " pg=" << (uint32_t)qp->m_pg << " size_bytes=" << qp->m_size << " flow=";
     EmitFlow(std::cout, qp);
@@ -187,6 +203,7 @@ void EventLogger::OnHostSend(uint32_t node_id, uint32_t port, Ptr<RdmaQueuePair>
 
 void EventLogger::OnHostRecv(uint32_t node_id, uint32_t port, uint8_t pg, uint32_t sip, uint32_t dip, uint16_t sport,
                              uint16_t dport, uint64_t received) {
+  EMIT_LOCK;
   if (!m_enabled) return;
   FlowSizeKey key{sip, dip, sport, dport};
   uint8_t& mark = m_hostRecvMark[key];
@@ -234,6 +251,7 @@ void EventLogger::OnHostRecv(uint32_t node_id, uint32_t port, uint8_t pg, uint32
 }
 
 void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
+  EMIT_LOCK;
   if (!m_enabled) return;
   int64_t t = Simulator::Now().GetNanoSeconds();
   uint64_t fct_ns = (Simulator::Now() - qp->startTime).GetNanoSeconds();
@@ -283,6 +301,7 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
 void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t out_port, uint8_t pg,
                                   uint64_t bytes, uint64_t payload, uint32_t src_ip, uint32_t dst_ip,
                                   uint16_t sport, uint16_t dport) {
+  EMIT_LOCK;
   if (!m_enabled) return;
   int64_t t = Simulator::Now().GetNanoSeconds();
   SwitchFlowKey key{switch_id, src_ip, dst_ip, sport, dport};
@@ -338,6 +357,7 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t
 // the flow) there is no open cut to attribute to, so this is a no-op. Observe-only; no output.
 void EventLogger::OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64_t payload,
                                    uint32_t src_ip, uint32_t dst_ip, uint16_t sport, uint16_t dport) {
+  EMIT_LOCK;
   if (!m_enabled) return;
   SwitchFlowKey key{switch_id, src_ip, dst_ip, sport, dport};
   auto it = m_switchFlows.find(key);
@@ -380,6 +400,7 @@ void EventLogger::OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64
 // Emit the whole fabric: one "EVENT node" per node, then one "EVENT link" per link (each printed once).
 // NodeList in id order; each setup path calls this ONCE after wiring (report-current-state).
 void EventLogger::DumpAllNodeInfo() {
+  EMIT_LOCK;
   if (!m_enabled) return;
   for (uint32_t i = 0; i < NodeList::GetNNodes(); i++) EmitNode(NodeList::GetNode(i)->GetId());
   for (uint32_t i = 0; i < NodeList::GetNNodes(); i++) EmitNodeLinks(NodeList::GetNode(i)->GetId());
@@ -389,6 +410,7 @@ void EventLogger::DumpAllNodeInfo() {
 // build-only params the structure can't show -- its RdmaHw cca + Ipv4 address (each guarded so a host
 // without a full RDMA/IP stack still emits id + class).
 void EventLogger::EmitNode(uint32_t node_id) {
+  EMIT_LOCK;
   Ptr<Node> node = NodeList::GetNode(node_id);
   if (!node) return;
   std::cout << "EVENT node id=" << node_id << " class=" << node->GetInstanceTypeId().GetName();
@@ -405,6 +427,7 @@ void EventLogger::EmitNode(uint32_t node_id) {
 // (node_id < peer node id), so each QbbChannel prints a single line. Carries the link's bw (the port's
 // DataRate) + delay (the channel delay) -- the media params a parser needs to rebuild the Netlist.
 void EventLogger::EmitNodeLinks(uint32_t node_id) {
+  EMIT_LOCK;
   Ptr<Node> node = NodeList::GetNode(node_id);
   if (!node) return;
   for (uint32_t p = 0; p < node->GetNDevices(); p++) {
@@ -433,6 +456,7 @@ void EventLogger::EmitNodeLinks(uint32_t node_id) {
 // immediately (transitions are low-frequency thanks to the call-site guard). A paused
 // interval is the [paused=1 ... paused=0] pair for that (node, port, q).
 void EventLogger::OnPfc(uint32_t node_id, uint32_t port, uint32_t q_index, bool paused) {
+  EMIT_LOCK;
   if (!m_enabled) return;
   std::cout << "EVENT pfc"
             << " t_ns=" << Simulator::Now().GetNanoSeconds()
@@ -446,6 +470,7 @@ void EventLogger::OnPfc(uint32_t node_id, uint32_t port, uint32_t q_index, bool 
 // One "EVENT drop ..." line per packet the switch MMU drops on a full ingress headroom (PFC failed
 // to be lossless). Structured replacement for the old debug printf. Should be ZERO in a sound run.
 void EventLogger::OnDrop(uint32_t node_id, uint32_t port, uint32_t q_index, uint32_t bytes) {
+  EMIT_LOCK;
   if (!m_enabled) return;
   std::cout << "EVENT drop"
             << " t_ns=" << Simulator::Now().GetNanoSeconds()
@@ -460,6 +485,7 @@ void EventLogger::OnDrop(uint32_t node_id, uint32_t port, uint32_t q_index, uint
 // 5-tuple so the snapshot order is deterministic + canonical. sent=snd_nxt (bytes put
 // on wire), acked=snd_una (bytes acknowledged), remaining=size-sent.
 void EventLogger::DumpActiveSet(int64_t t_ns, uint32_t subnetKey) {
+  EMIT_LOCK;
   auto it = m_activeBySubnet.find(subnetKey);
   if (it == m_activeBySubnet.end()) return;
   std::vector<Ptr<RdmaQueuePair>> v = it->second;
@@ -495,6 +521,7 @@ void EventLogger::DumpActiveSet(int64_t t_ns, uint32_t subnetKey) {
 // mutates nothing. Snapshotted at every cut transition (switch_enter/leave, qp_add, qp_complete,
 // rate_update). flow= is printed exactly like EmitSwitchEnter/EmitSwitchLeave.
 void EventLogger::DumpFlowCut(int64_t t_ns) {
+  EMIT_LOCK;
   if (!m_cutProbe) return; // opt-in gate (NS3_CUT_PROBE): off by default so goldens stay flow_cut-free
   for (const auto& kv : m_switchFlows) {
     const SwitchFlowKey& k = kv.first;
@@ -520,6 +547,7 @@ void EventLogger::DumpFlowCut(int64_t t_ns) {
 // and not covered), no subnet filter; only (port, pg) with a NON-ZERO backlog is emitted (an absent
 // one == 0). Fired at each completion so it pairs with that instant's active snapshot.
 void EventLogger::DumpAllQueues(int64_t t_ns) {
+  EMIT_LOCK;
   for (auto it = NodeList::Begin(); it != NodeList::End(); ++it) {
     Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(*it);
     if (!sw) continue;
@@ -550,6 +578,7 @@ void EventLogger::DumpAllQueues(int64_t t_ns) {
 // 10 s stop and emitted ~100M lines). The egress backlog is transient between events, so this is
 // where a non-zero queue shows up -- completion-only sampling reads ~0.
 void EventLogger::PeriodicQueueDump() {
+  EMIT_LOCK;
   if (!m_enabled) return;
   bool anyActive = false;
   for (const auto& kv : m_activeBySubnet) {
@@ -564,6 +593,7 @@ void EventLogger::PeriodicQueueDump() {
 // egress backlog -- at Now(), in the same format the streaming hooks emit. Called by control.h on a
 // harness QUERY; unlike the automatic hooks this fires on demand, at an arbitrary paused instant.
 void EventLogger::DumpState() {
+  EMIT_LOCK;
   int64_t t = Simulator::Now().GetNanoSeconds();
   for (const auto& kv : m_activeBySubnet) {
     if (!kv.second.empty()) DumpActiveSet(t, kv.first);

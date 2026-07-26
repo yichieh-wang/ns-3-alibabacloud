@@ -3,6 +3,7 @@
 #include <ns3/rdma-queue-pair.h>
 #include <ns3/ptr.h>
 #include <cstdint>
+#include <mutex>
 #include <map>
 #include <vector>
 #include <string>
@@ -30,6 +31,13 @@ namespace ns3 {
 // keys on:
 //   EVENT active t_ns=... flow=... sent_bytes=... acked_bytes=... remaining_bytes=... rate_gbps=...
 class EventLogger {
+public:
+  // ONE process-wide stdout lock. Every trace-line emitter serializes here — this logger's
+  // hooks AND any scratch program's own lines (FLOW_COMPLETE) — because UNISON (mtp) fires
+  // them from many worker threads and unserialized `<<` chains TEAR lines mid-write. The
+  // parse tolerates reordered lines (it sorts instants); it cannot tolerate torn ones.
+  static std::recursive_mutex& EmitLock();
+
 public:
   static EventLogger& Get();
   bool Enabled() const { return m_enabled; }
