@@ -78,6 +78,7 @@ private:
   uint16_t m_sport, m_dport;
   uint32_t m_win; // bound of on-the-fly packets
   uint64_t m_baseRtt; // base Rtt
+  uint64_t m_initRateBps; // initial sending rate (bits/s); 0 = line rate (a mid-state flow re-materializes at its observed rate)
   void (*msg_handler)(void* fun_arg);
   void* fun_arg;
   uint64_t tag; 

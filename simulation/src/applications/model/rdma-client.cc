@@ -74,6 +74,10 @@ TypeId RdmaClient::GetTypeId(void) {
           .AddAttribute("BaseRtt", "Base Rtt", UintegerValue(0),
                         MakeUintegerAccessor(&RdmaClient::m_baseRtt),
                         MakeUintegerChecker<uint64_t>())
+          .AddAttribute("InitialRateBps", "Initial sending rate (bits/s); 0 = line rate",
+                        UintegerValue(0),
+                        MakeUintegerAccessor(&RdmaClient::m_initRateBps),
+                        MakeUintegerChecker<uint64_t>())
           .AddAttribute("Tag", "Tag", UintegerValue(0),
                         MakeUintegerAccessor(&RdmaClient::tag),
                         MakeUintegerChecker<uint64_t>())
@@ -134,7 +138,7 @@ void RdmaClient::StartApplication(void) {
   rdma->AddQueuePair(src, dest, tag, m_size, m_pg, m_sip, m_dip, m_sport,
                      m_dport, m_win, m_baseRtt,
                      MakeCallback(&RdmaClient::Finish, this),
-                     MakeCallback(&RdmaClient::Sent, this));
+                     MakeCallback(&RdmaClient::Sent, this), m_initRateBps);
 }
 
 void RdmaClient::StopApplication() {

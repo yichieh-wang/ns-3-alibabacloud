@@ -270,7 +270,7 @@ Ptr<RdmaQueuePair> RdmaHw::GetQp(uint32_t dip, uint16_t sport, uint16_t pg){
 		return it->second;
 	return NULL;
 }
-void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent){
+void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent, uint64_t initRateBps){
 	// create qp
 	Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(pg, sip, dip, sport, dport);
 	qp->SetSrc(src);
@@ -311,6 +311,15 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 		qp->tmly.m_curRate = m_bps;
 	}else if (m_cc_mode == 10){
 		qp->hpccPint.m_curRate = m_bps;
+	}
+	// A mid-state flow re-materializes at its OBSERVED sending rate (0 = a fresh flow at
+	// line rate). DCQCN's target follows so the rate HOLDS until real CNP/timer events move
+	// it; m_max_rate stays the NIC's physical ceiling. Other cc modes: grow when observed.
+	if (initRateBps > 0){
+		DataRate initRate(initRateBps);
+		qp->m_rate = initRate;
+		if (m_cc_mode == 1)
+			qp->mlx.m_targetRate = initRate;
 	}
 	// NVLS settings
 	if(nvls_enable == 1) qp->nvls_enable = 1;
