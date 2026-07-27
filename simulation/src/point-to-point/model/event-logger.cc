@@ -148,6 +148,9 @@ void EventLogger::OnRateUpdate(Ptr<RdmaQueuePair> qp, const char* why) {
   EmitFlow(std::cout, qp);
   std::cout << " why=" << why
             << " rate_gbps=" << (qp->m_rate.GetBitRate() * 1e-9)
+            // mlx = DCQCN (cc_mode 1), the only family we observe; the recovery ceiling the
+            // rate climbs toward between CNPs — a trajectory node is (t, rate, target).
+            << " target_gbps=" << (qp->mlx.m_targetRate.GetBitRate() * 1e-9)
             << std::endl;
   DumpFlowCut(t); // a CC rate change is a cut transition: snapshot every open segment's in/out payload
 }
