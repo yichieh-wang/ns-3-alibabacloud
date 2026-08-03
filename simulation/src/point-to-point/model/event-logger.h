@@ -72,9 +72,14 @@ public:
   // (p->GetSize(); feeds switch_leave's bytes=, unchanged) and `payload` = the L4
   // PAYLOAD (p->GetSize() - ch.GetSerializedSize(), the receiver's identity in
   // RdmaHw::ReceiveUdp; feeds flow_cut's in_bytes= == the cut_in count).
+  // `cc` selects the flow's CC STREAM segment (the ACK/NACK reverse leg, NS3_CC_EVENTS-gated;
+  // spoken under the DATA flow's 4-tuple + kind=cc, byte counters = ON-WIRE bytes since an ACK
+  // has no L4 payload; no size => no inject_done / real-exit close -- ends at qp_complete).
+  // `marked` = this packet carries the leg's congestion stamp (data: ECN CE bits; cc: the CNP
+  // flag) -- accumulated into the in_marked/out_marked counters, first one emits flow_mark_in/_out.
   void OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t out_port, uint8_t pg,
                        uint64_t bytes, uint64_t payload, uint32_t src_ip, uint32_t dst_ip,
-                       uint16_t sport, uint16_t dport);
+                       uint16_t sport, uint16_t dport, bool cc, bool marked);
 
   // SWITCH-EGRESS-TRANSMIT hook: called from SwitchNode::SwitchNotifyDequeue when a DATA packet is
   // dequeued from the BEgressQueue and handed to TransmitStart -- i.e. it TRULY LEAVES this switch
@@ -83,7 +88,11 @@ public:
   // matching (switch, 5-tuple) OPEN segment's cut_out counter (flow_cut's out_bytes=). No-op if the
   // segment is already closed (nothing open to attribute to). Observe-only; off => no-op.
   void OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64_t payload,
-                        uint32_t src_ip, uint32_t dst_ip, uint16_t sport, uint16_t dport);
+                        uint32_t src_ip, uint32_t dst_ip, uint16_t sport, uint16_t dport,
+                        bool cc, bool marked);
+
+  // NS3_CC_EVENTS gate accessor: switch-node call sites skip the CC-stream hooks entirely when off.
+  bool CcEventsEnabled() const { return m_ccEvents; }
 
   // PFC hook: a QbbNetDevice's TX on (port, queue) PAUSES (it received a PFC PAUSE frame)
   // or RESUMES. Emitted ONLY on a real state TRANSITION -- no spam on the periodic
@@ -171,6 +180,9 @@ private:
   bool m_queueProbe = false;        // opt-in gate (NS3_QUEUE_PROBE): the 5us probe is heavy, off by default
   bool m_queueProbeStarted = false; // latched while a burst's probe loop is live; reset when it goes idle
   bool m_cutProbe = false;          // opt-in gate (NS3_CUT_PROBE): the flow_cut byte-level dump, off by default (goldens stay clean)
+  bool m_ccEvents = false;          // opt-in gate (NS3_CC_EVENTS): the CC plane -- cc-stream (ACK/NACK) segments with
+                                    // kind=cc, the marked counters on flow_cut, and the flow_mark_in/_out onset
+                                    // events. Off by default: every existing trace stays byte-identical.
 
   // Per (switch, flow) traversal state for OnSwitchForward. Key is the (switch,
   // 5-tuple) with NO egress port, so a flow that leaves an egress and later
@@ -182,12 +194,15 @@ private:
     uint32_t dst_ip;
     uint16_t sport;
     uint16_t dport;
+    uint8_t  kind; // 0 = data, 1 = cc: the flow's CC STREAM (ACK/NACK reverse leg) is its own
+                   // segment under the SAME data 4-tuple -- the two streams never merge.
     bool operator<(const SwitchFlowKey& o) const {
       if (switch_id != o.switch_id) return switch_id < o.switch_id;
       if (src_ip    != o.src_ip)    return src_ip    < o.src_ip;
       if (dst_ip    != o.dst_ip)    return dst_ip    < o.dst_ip;
       if (sport     != o.sport)     return sport     < o.sport;
-      return dport < o.dport;
+      if (dport     != o.dport)     return dport     < o.dport;
+      return kind < o.kind;
     }
   };
   // The flow's CURRENT segment at this switch: the ingress it arrived on + the egress it
@@ -207,6 +222,9 @@ private:
     uint64_t bytes;
     uint64_t in_bytes;
     uint64_t out_bytes;
+    uint64_t in_marked;  // stamped units in  (data: CE-carrying payload bytes; cc: CNP-flagged wire bytes)
+    uint64_t out_marked; // stamped units out -- the stamp is STICKY (set upstream, carried to the wire),
+                         // so any port's counter includes upstream stamps: cut-composable like in/out_bytes
     uint8_t  pg;          // the flow's priority group, told at the segment's open (flow_inject).
     bool     inject_done; // its last byte has entered (flow_inject_done fired): dedups the emit.
     bool     eject_done; // its last byte has left the egress (flow_eject_done fired): kept (not erased) so a
