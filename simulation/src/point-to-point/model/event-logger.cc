@@ -162,13 +162,16 @@ void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
 void EventLogger::OnHostCcSend(uint32_t node_id, uint32_t port, uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, uint8_t pg, uint32_t wire_bytes, bool cnp, uint64_t data_received) {
   EMIT_LOCK;
   if (!m_enabled || !m_hostPortEvents || !m_ccEvents) return;
-  // HOST-CC quadrant, NoC convention: the terminal SENDING its reverse leg (ACK/NACK/CNP)
-  // is INJECTING it into the network -- flow_inject/_done kind=cc at the sink-side NIC,
-  // cumulative wire bytes in in_bytes, the CNP-flagged share in in_marked.
+  // HOST-CC quadrant, NoC convention: the terminal SENDING its reverse leg is INJECTING
+  // it into the network -- flow_inject/_done kind=cc at the sink-side NIC. THE FLOW IS
+  // THE CNP: only flagged packets belong to it (birth at the first flag, bytes fold
+  // flagged wire bytes alone, a zero-flag reverse leg never appears) and the cc plane
+  // has no mark vocabulary of its own.
   int64_t t = Simulator::Now().GetNanoSeconds();
   SwitchFlowKey key{node_id, sip, dip, sport, dport, 1};
   auto it = m_switchFlows.find(key);
   if (it == m_switchFlows.end()) {
+    if (!cnp) return; // a plain ACK is not the flow
     it = m_switchFlows.emplace(key, SwitchFlowStat{port, port, t, t, 0, 0, 0, 0, 0, pg, false, false, true}).first;
     std::cout << "EVENT flow_inject t_ns=" << t << " switch=" << node_id << " ingress_port=" << port
               << " egress_port=" << port << " pg=" << (uint32_t)pg << " kind=cc flow="
@@ -176,13 +179,12 @@ void EventLogger::OnHostCcSend(uint32_t node_id, uint32_t port, uint32_t sip, ui
     DumpFlowCut(t);
   }
   SwitchFlowStat& s = it->second;
-  s.last_ns = t;
-  s.in_bytes += wire_bytes;
   if (cnp) {
-    if (s.in_marked == 0) EmitMarkOnset("flow_mark_in", t, node_id, "ingress_port", port, sip, dip, sport, dport, true);
-    s.in_marked += wire_bytes;
+    s.last_ns = t;
+    s.in_bytes += wire_bytes;
   }
-  // the ACK acknowledging the payload's LAST byte closes the reverse leg's writing hand
+  // the ACK acknowledging the payload's LAST byte closes the flow's writing hand (no more
+  // data, no more echoes) -- carried by ANY later ack once the flow exists
   auto sz = m_flowPayload.find(FlowSizeKey{sip, dip, sport, dport});
   if (!s.inject_done && sz != m_flowPayload.end() && data_received >= sz->second) {
     s.inject_done = true;
@@ -197,12 +199,13 @@ void EventLogger::OnHostCcRecv(uint32_t node_id, uint32_t port, uint32_t sip, ui
   EMIT_LOCK;
   if (!m_enabled || !m_hostPortEvents || !m_ccEvents) return;
   // HOST-CC quadrant, NoC convention: the terminal RECEIVING its reverse leg is EJECTING
-  // it out of the network -- flow_eject/_done kind=cc at the source-side NIC, cumulative
-  // wire bytes in out_bytes, the CNP-flagged share in out_marked.
+  // it out of the network -- flow_eject/_done kind=cc at the source-side NIC. Same law as
+  // the send side: only flagged packets ARE the flow; no mark vocabulary.
   int64_t t = Simulator::Now().GetNanoSeconds();
   SwitchFlowKey key{node_id, sip, dip, sport, dport, 1};
   auto it = m_switchFlows.find(key);
   if (it == m_switchFlows.end()) {
+    if (!cnp) return; // a plain ACK is not the flow
     it = m_switchFlows.emplace(key, SwitchFlowStat{port, port, t, t, 0, 0, 0, 0, 0, pg, false, false, false}).first;
     std::cout << "EVENT flow_eject t_ns=" << t << " switch=" << node_id << " egress_port=" << port
               << " pg=" << (uint32_t)pg << " kind=cc flow="
@@ -210,11 +213,9 @@ void EventLogger::OnHostCcRecv(uint32_t node_id, uint32_t port, uint32_t sip, ui
     DumpFlowCut(t);
   }
   SwitchFlowStat& s = it->second;
-  s.last_ns = t;
-  s.out_bytes += wire_bytes;
   if (cnp) {
-    if (s.out_marked == 0) EmitMarkOnset("flow_mark_out", t, node_id, "egress_port", port, sip, dip, sport, dport, true);
-    s.out_marked += wire_bytes;
+    s.last_ns = t;
+    s.out_bytes += wire_bytes;
   }
   if (finished && !s.eject_done) {
     s.eject_done = true;
@@ -400,6 +401,7 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t
                                   uint16_t sport, uint16_t dport, bool cc, bool marked) {
   EMIT_LOCK;
   if (!m_enabled) return;
+  if (cc && (!m_ccEvents || !marked)) return; // THE FLOW IS THE CNP: a plain reverse-leg packet is not it
   int64_t t = Simulator::Now().GetNanoSeconds();
   SwitchFlowKey key{switch_id, src_ip, dst_ip, sport, dport, (uint8_t)(cc ? 1 : 0)};
   // A cc segment has no declared size (m_flowPayload speaks the DATA payload): no inject_done,
@@ -409,7 +411,7 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t
   // Fold one packet's stamp into the in-side counter; the segment's FIRST stamped unit is the
   // CC plane's onset instant (flow_mark_in). NS3_CC_EVENTS-gated with the whole marked machinery.
   auto fold_marked_in = [&](SwitchFlowStat& s) {
-    if (!m_ccEvents || !marked) return;
+    if (cc || !m_ccEvents || !marked) return; // marks belong to DATA (CE) alone
     if (s.in_marked == 0)
       EmitMarkOnset("flow_mark_in", t, switch_id, "ingress_port", s.in_port, src_ip, dst_ip, sport, dport, cc);
     s.in_marked += payload;
@@ -470,16 +472,21 @@ void EventLogger::OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64
                                    bool cc, bool marked) {
   EMIT_LOCK;
   if (!m_enabled) return;
+  if (cc && (!m_ccEvents || !marked)) return; // THE FLOW IS THE CNP: a plain reverse-leg packet is not it
   SwitchFlowKey key{switch_id, src_ip, dst_ip, sport, dport, (uint8_t)(cc ? 1 : 0)};
   auto it = m_switchFlows.find(key);
   if (it == m_switchFlows.end()) return; // no open segment (closed/drained): nothing to attribute
   // cc: no declared size (see OnSwitchForward) -- first_out still reveals the exit, no size-close.
   auto sz = cc ? m_flowPayload.end() : m_flowPayload.find(FlowSizeKey{src_ip, dst_ip, sport, dport});
   uint64_t size = (sz == m_flowPayload.end()) ? 0 : sz->second; // 0 = unknown -> field omitted
+  int64_t t = Simulator::Now().GetNanoSeconds();
+  it->second.last_ns = t; // the egress fold is activity too: the sweep's fallback leave_ns must
+                          // never precede a dequeue this segment already spoke (codex) -- acute for
+                          // cc, whose sparse flagged packets leave last_ns far behind the queue dwell
   bool first_out = (it->second.out_bytes == 0);
   it->second.out_bytes += payload;
   bool mark_onset = false;
-  if (m_ccEvents && marked) {
+  if (m_ccEvents && marked && !cc) { // marks belong to DATA (CE) alone
     // The stamp finalized at THIS dequeue (post-ShouldSendCN), so the out-side counter reads the
     // wire truth. The onset line itself is emitted BELOW the first_out block: a packet that is
     // both the segment's first byte out AND marked must speak flow_eject before flow_mark_out
@@ -493,7 +500,6 @@ void EventLogger::OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64
     // the cut-event symmetry (switch_enter = first byte in, switch_leave = last byte out). The parser
     // reveals the flow's exit port HERE (observed, never predicted) and emits the Start crossing. A
     // reroute reopens the segment with out_bytes = 0, so the new egress re-reveals -- correct.
-    int64_t t = Simulator::Now().GetNanoSeconds();
     std::cout << "EVENT flow_eject"
               << " t_ns=" << t
               << " switch=" << switch_id
@@ -507,7 +513,7 @@ void EventLogger::OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64
     DumpFlowCut(t); // a cut transition: snapshot so the reveal-instant state reads fresh byte counters
   }
   if (mark_onset)
-    EmitMarkOnset("flow_mark_out", Simulator::Now().GetNanoSeconds(), switch_id, "egress_port",
+    EmitMarkOnset("flow_mark_out", t, switch_id, "egress_port",
                   out_port, src_ip, dst_ip, sport, dport, cc);
 
   // Real EGRESS-EXIT: once cut_out has reached the flow's total payload, this flow's LAST byte has just
@@ -515,7 +521,6 @@ void EventLogger::OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64
   // symmetric to switch_enter at the real entry, instead of deferring to qp_complete (the sender ACK,
   // ~RTT later). Drop the segment BEFORE the snapshot so flow_cut shows the SURVIVORS at the real exit.
   if (sz != m_flowPayload.end() && !it->second.eject_done && it->second.out_bytes >= sz->second) {
-    int64_t t = Simulator::Now().GetNanoSeconds();
     EmitSwitchLeave(switch_id, it->second.out_port, size, src_ip, dst_ip, sport, dport, t, it->second.bytes, cc);
     it->second.eject_done = true; // mark eject_done but KEEP the segment: a lossy retransmit's later forward
                                 // then folds in via find() instead of re-opening a spurious segment.
