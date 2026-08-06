@@ -472,6 +472,9 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 		uint32_t did = (dip >> 8) & 0xffff;
 		// send
 		uint32_t nic_idx = GetNicIdxOfRxQp(rxQp);
+		EventLogger::Get().OnHostCcSend(m_node->GetId(), m_nic[nic_idx].dev->GetIfIndex(),
+		                                ch.sip, ch.dip, ch.udp.sport, ch.udp.dport, (uint8_t)ch.udp.pg,
+		                                newp->GetSize(), ecnbits != 0, rxQp->ReceiverNextExpectedSeq); // host-cc quadrant: the reverse leg leaves the terminal
 		m_nic[nic_idx].dev->RdmaEnqueueHighPrioQ(newp);
 		// 发送给目标 NVSwitch 的报文
 		if(did == m_node->GetId() && m_node->GetNodeType() == 2 && ch.m_tos == 4) m_nic[nic_idx].dev->SwitchAsHostSend();
@@ -547,6 +550,9 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			uint64_t goback_seq = seq / m_chunk * m_chunk;
 			qp->Acknowledge(goback_seq);
 		}
+		EventLogger::Get().OnHostCcRecv(m_node->GetId(), dev->GetIfIndex(),
+		                                qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport, (uint8_t)qp->m_pg,
+		                                p->GetSize(), cnp != 0, qp->IsFinished()); // host-cc quadrant: BEFORE QpComplete erases the stat
 		if (qp->IsFinished()){
 			QpComplete(qp);
 		}

@@ -53,6 +53,11 @@ public:
   // of the sender (host_send / host_send_done) and IN at the receiver (host_recv / host_recv_done).
   // Called per packet; the logger derives the four endpoint events from the cumulative counters.
   void OnHostSend(uint32_t node_id, uint32_t port, Ptr<RdmaQueuePair> qp);
+  // HOST-CC quadrant (NS3_HOST_PORT_EVENTS + NS3_CC_EVENTS), NoC convention as for payload:
+  // the dst terminal SENDING its reverse leg (ACK/NACK/CNP) is INJECTING it into the network;
+  // the src terminal RECEIVING it is EJECTING it out. Flow spelled as the DATA tuple, kind=cc.
+  void OnHostCcSend(uint32_t node_id, uint32_t port, uint32_t data_sip, uint32_t data_dip, uint16_t data_sport, uint16_t data_dport, uint8_t pg, uint32_t wire_bytes, bool cnp, uint64_t data_received);
+  void OnHostCcRecv(uint32_t node_id, uint32_t port, uint32_t data_sip, uint32_t data_dip, uint16_t data_sport, uint16_t data_dport, uint8_t pg, uint32_t wire_bytes, bool cnp, bool finished);
   void OnHostRecv(uint32_t node_id, uint32_t port, uint8_t pg, uint32_t sip, uint32_t dip, uint16_t sport,
                   uint16_t dport, uint64_t received);
   void OnQpComplete(Ptr<RdmaQueuePair> qp);
@@ -230,6 +235,9 @@ private:
     bool     eject_done; // its last byte has left the egress (flow_eject_done fired): kept (not erased) so a
                        // lossy retransmit's forward folds in instead of re-opening a spurious segment;
                        // skipped by flow_cut; erased at qp_complete.
+    bool     inject_side; // a terminal's SENDING-side segment (OnHostCcSend): its whole story is the
+                       // inject family -- the eject story lives at the FAR terminal, so qp_complete's
+                       // fallback closes it as inject_done, never as a leave.
   };
   std::map<SwitchFlowKey, SwitchFlowStat> m_switchFlows;
 

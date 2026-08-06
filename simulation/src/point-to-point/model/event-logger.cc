@@ -159,6 +159,70 @@ void EventLogger::OnQpAdded(Ptr<RdmaQueuePair> qp) {
   }
 }
 
+void EventLogger::OnHostCcSend(uint32_t node_id, uint32_t port, uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, uint8_t pg, uint32_t wire_bytes, bool cnp, uint64_t data_received) {
+  EMIT_LOCK;
+  if (!m_enabled || !m_hostPortEvents || !m_ccEvents) return;
+  // HOST-CC quadrant, NoC convention: the terminal SENDING its reverse leg (ACK/NACK/CNP)
+  // is INJECTING it into the network -- flow_inject/_done kind=cc at the sink-side NIC,
+  // cumulative wire bytes in in_bytes, the CNP-flagged share in in_marked.
+  int64_t t = Simulator::Now().GetNanoSeconds();
+  SwitchFlowKey key{node_id, sip, dip, sport, dport, 1};
+  auto it = m_switchFlows.find(key);
+  if (it == m_switchFlows.end()) {
+    it = m_switchFlows.emplace(key, SwitchFlowStat{port, port, t, t, 0, 0, 0, 0, 0, pg, false, false, true}).first;
+    std::cout << "EVENT flow_inject t_ns=" << t << " switch=" << node_id << " ingress_port=" << port
+              << " egress_port=" << port << " pg=" << (uint32_t)pg << " kind=cc flow="
+              << Ipv4Address(sip) << ":" << sport << "->" << Ipv4Address(dip) << ":" << dport << std::endl;
+    DumpFlowCut(t);
+  }
+  SwitchFlowStat& s = it->second;
+  s.last_ns = t;
+  s.in_bytes += wire_bytes;
+  if (cnp) {
+    if (s.in_marked == 0) EmitMarkOnset("flow_mark_in", t, node_id, "ingress_port", port, sip, dip, sport, dport, true);
+    s.in_marked += wire_bytes;
+  }
+  // the ACK acknowledging the payload's LAST byte closes the reverse leg's writing hand
+  auto sz = m_flowPayload.find(FlowSizeKey{sip, dip, sport, dport});
+  if (!s.inject_done && sz != m_flowPayload.end() && data_received >= sz->second) {
+    s.inject_done = true;
+    std::cout << "EVENT flow_inject_done t_ns=" << t << " switch=" << node_id
+              << " ingress_port=" << port << " kind=cc flow="
+              << Ipv4Address(sip) << ":" << sport << "->" << Ipv4Address(dip) << ":" << dport << std::endl;
+    DumpFlowCut(t);
+  }
+}
+
+void EventLogger::OnHostCcRecv(uint32_t node_id, uint32_t port, uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, uint8_t pg, uint32_t wire_bytes, bool cnp, bool finished) {
+  EMIT_LOCK;
+  if (!m_enabled || !m_hostPortEvents || !m_ccEvents) return;
+  // HOST-CC quadrant, NoC convention: the terminal RECEIVING its reverse leg is EJECTING
+  // it out of the network -- flow_eject/_done kind=cc at the source-side NIC, cumulative
+  // wire bytes in out_bytes, the CNP-flagged share in out_marked.
+  int64_t t = Simulator::Now().GetNanoSeconds();
+  SwitchFlowKey key{node_id, sip, dip, sport, dport, 1};
+  auto it = m_switchFlows.find(key);
+  if (it == m_switchFlows.end()) {
+    it = m_switchFlows.emplace(key, SwitchFlowStat{port, port, t, t, 0, 0, 0, 0, 0, pg, false, false, false}).first;
+    std::cout << "EVENT flow_eject t_ns=" << t << " switch=" << node_id << " egress_port=" << port
+              << " pg=" << (uint32_t)pg << " kind=cc flow="
+              << Ipv4Address(sip) << ":" << sport << "->" << Ipv4Address(dip) << ":" << dport << std::endl;
+    DumpFlowCut(t);
+  }
+  SwitchFlowStat& s = it->second;
+  s.last_ns = t;
+  s.out_bytes += wire_bytes;
+  if (cnp) {
+    if (s.out_marked == 0) EmitMarkOnset("flow_mark_out", t, node_id, "egress_port", port, sip, dip, sport, dport, true);
+    s.out_marked += wire_bytes;
+  }
+  if (finished && !s.eject_done) {
+    s.eject_done = true;
+    EmitSwitchLeave(node_id, port, 0, sip, dip, sport, dport, t, s.out_bytes, true);
+    DumpFlowCut(t);
+  }
+}
+
 void EventLogger::OnRateUpdate(Ptr<RdmaQueuePair> qp, const char* why) {
   EMIT_LOCK;
   if (!m_enabled) return;
@@ -206,7 +270,7 @@ void EventLogger::OnHostSend(uint32_t node_id, uint32_t port, Ptr<RdmaQueuePair>
   auto it = m_switchFlows.find(key);
   if (it == m_switchFlows.end()) {
     if (sent == 0) return;
-    it = m_switchFlows.emplace(key, SwitchFlowStat{port, port, t, t, 0, 0, 0, 0, 0, (uint8_t)qp->m_pg, false, false}).first;
+    it = m_switchFlows.emplace(key, SwitchFlowStat{port, port, t, t, 0, 0, 0, 0, 0, (uint8_t)qp->m_pg, false, false, false}).first;
     std::cout << "EVENT flow_inject t_ns=" << t << " switch=" << node_id << " ingress_port=" << port
               << " egress_port=" << port << " pg=" << (uint32_t)qp->m_pg << " size_bytes=" << qp->m_size << " flow=";
     EmitFlow(std::cout, qp);
@@ -257,7 +321,7 @@ void EventLogger::OnHostRecv(uint32_t node_id, uint32_t port, uint8_t pg, uint32
   auto it = m_switchFlows.find(skey);
   if (it == m_switchFlows.end()) {
     if (received == 0) return;
-    it = m_switchFlows.emplace(skey, SwitchFlowStat{port, port, t, t, 0, 0, 0, 0, 0, pg, false, false}).first;
+    it = m_switchFlows.emplace(skey, SwitchFlowStat{port, port, t, t, 0, 0, 0, 0, 0, pg, false, false, false}).first;
     std::cout << "EVENT flow_eject t_ns=" << t << " switch=" << node_id << " egress_port=" << port
               << " pg=" << (uint32_t)pg;
     if (size) std::cout << " size_bytes=" << size;
@@ -306,7 +370,14 @@ void EventLogger::OnQpComplete(Ptr<RdmaQueuePair> qp) {
       // Matches BOTH kinds (the cc stream shares the data tuple): the flow's completion also ends
       // its cc segments -- which have no size of their own, so a cc leave omits size_bytes.
       const SwitchFlowStat& s = it->second;
-      if (!s.eject_done) // never hit its egress-exit (lossy/straggler): fall back to the last-forward time
+      if (s.inject_side) {
+        // The SENDING terminal has no eject story (that lives at the far terminal): a
+        // straggler whose last ACK never spoke closes its WRITING hand here instead.
+        if (!s.inject_done)
+          std::cout << "EVENT flow_inject_done t_ns=" << t << " switch=" << k.switch_id
+                    << " ingress_port=" << s.in_port << " kind=cc flow="
+                    << Ipv4Address(k.src_ip) << ":" << k.sport << "->" << Ipv4Address(k.dst_ip) << ":" << k.dport << std::endl;
+      } else if (!s.eject_done) // never hit its egress-exit (lossy/straggler): fall back to the last-forward time
         EmitSwitchLeave(k.switch_id, s.out_port, (k.kind != 0) ? 0 : qp->m_size, k.src_ip, k.dst_ip, k.sport, k.dport,
                         s.last_ns, s.bytes, k.kind != 0);
       it = m_switchFlows.erase(it);
@@ -364,7 +435,7 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t
   if (it == m_switchFlows.end()) {
     // First sighting: open the flow's segment (cut_in seeded, cut_out starts at 0 -- it accrues
     // later when packets are actually transmitted out the egress via OnSwitchTransmit).
-    it = m_switchFlows.emplace(key, SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0, 0, 0, pg, false, false}).first;
+    it = m_switchFlows.emplace(key, SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0, 0, 0, pg, false, false, false}).first;
     EmitSwitchEnter(t, switch_id, in_port, out_port, pg, size, src_ip, dst_ip, sport, dport, cc);
     fold_marked_in(it->second);
     DumpFlowCut(t); // flow_inject is a cut transition: snapshot all open segments
@@ -380,7 +451,7 @@ void EventLogger::OnSwitchForward(uint32_t switch_id, uint32_t in_port, uint32_t
     // REROUTE: egress changed -- close the old segment, open a new one.
     EmitSwitchLeave(switch_id, it->second.out_port, size, src_ip, dst_ip, sport, dport,
                     it->second.last_ns, it->second.bytes, cc);
-    it->second = SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0, 0, 0, pg, false, false};
+    it->second = SwitchFlowStat{out_port, in_port, t, t, bytes, payload, 0, 0, 0, pg, false, false, false};
     EmitSwitchEnter(t, switch_id, in_port, out_port, pg, size, src_ip, dst_ip, sport, dport, cc);
     fold_marked_in(it->second);
     DumpFlowCut(t); // flow_eject_done+flow_inject is a cut transition: snapshot all open segments
