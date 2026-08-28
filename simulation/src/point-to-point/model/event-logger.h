@@ -74,7 +74,7 @@ public:
   // change of egress is a reroute (close old segment + open new); the segment
   // closes as "EVENT switch_leave" at qp_complete. Never per-packet spam.
   // Carries BOTH byte counts of this forwarded packet: `bytes` = ON-WIRE size
-  // (p->GetSize(); feeds switch_leave's bytes=, unchanged) and `payload` = the L4
+  // (p->GetSize(); the segment's forward-side wire count) and `payload` = the L4
   // PAYLOAD (p->GetSize() - ch.GetSerializedSize(), the receiver's identity in
   // RdmaHw::ReceiveUdp; feeds flow_cut's in_bytes= == the cut_in count).
   // `cc` selects the flow's CC STREAM segment (the ACK/NACK reverse leg, NS3_CC_EVENTS-gated;
@@ -217,10 +217,10 @@ private:
   //   in_port   = ingress NetDevice the segment arrived on (-> flow_cut ingress_port=; the
   //               same value switch_enter prints as ingress_port=)
   //   out_port  = egress the segment uses now              (-> flow_cut egress_port=)
-  //   bytes     = ON-WIRE bytes routed here (forward-side; diagnostic -- the emitted
-  //               wire_bytes= reads out_wire, what truly left)
-  //   in_bytes  = PAYLOAD bytes routed here     (cut_in  -> flow_cut in_bytes=)
-  //   out_bytes = PAYLOAD bytes transmitted out (cut_out -> flow_cut out_bytes=)
+  //   bytes     = ON-WIRE bytes in (switch: forward-side; host send: the NIC total)
+  //               -> flow_cut in_wire= (flow_eject_done's wire_bytes= reads out_wire)
+  //   in_bytes  = PAYLOAD bytes routed here     (cut_in  -> flow_cut in_payload=)
+  //   out_bytes = PAYLOAD bytes transmitted out (cut_out -> flow_cut out_payload=)
   //   out_wire  = ON-WIRE bytes transmitted out (-> flow_eject_done wire_bytes=)
   struct SwitchFlowStat {
     uint32_t out_port;

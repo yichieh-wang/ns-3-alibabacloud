@@ -275,17 +275,26 @@ void EventLogger::OnHostSend(uint32_t node_id, uint32_t port, Ptr<RdmaQueuePair>
   // destructor's eject_done flush -- the wrong family for a source, a known truncated-trace wart.
   SwitchFlowKey key{node_id, qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport, 0};
   auto it = m_switchFlows.find(key);
+  bool opened = false;
   if (it == m_switchFlows.end()) {
     if (sent == 0) return;
     it = m_switchFlows.emplace(key, SwitchFlowStat{port, port, t, t, 0, 0, 0, 0, 0, 0, (uint8_t)qp->m_pg, false, false, false}).first;
+    opened = true;
+  }
+  // Counters land BEFORE any snapshot: the opening dump must already
+  // carry the transition packet, not a stale 0/0.
+  it->second.last_ns = t;
+  it->second.in_bytes = sent;
+  it->second.bytes = wire;      // in-side wire, the NIC's physical total (mirrors switch segments)
+  it->second.out_bytes = sent;  // a terminal has no interior: what it sent has LEFT it too
+  it->second.out_wire = wire;
+  if (opened) {
     std::cout << "EVENT flow_inject t_ns=" << t << " switch=" << node_id << " ingress_port=" << port
               << " egress_port=" << port << " pg=" << (uint32_t)qp->m_pg << " size_bytes=" << qp->m_size << " flow=";
     EmitFlow(std::cout, qp);
     std::cout << std::endl;
     DumpFlowCut(t);
   }
-  it->second.last_ns = t;
-  it->second.in_bytes = sent;
   if (sent >= qp->m_size) {
     std::cout << "EVENT flow_inject_done t_ns=" << t << " switch=" << node_id
               << " ingress_port=" << port << " size_bytes=" << qp->m_size << " flow=";
@@ -329,9 +338,19 @@ void EventLogger::OnHostRecv(uint32_t node_id, uint32_t port, uint8_t pg, uint32
   // destructor's eject_done flush, which for a sink is the RIGHT family.
   SwitchFlowKey skey{node_id, sip, dip, sport, dport, 0};
   auto it = m_switchFlows.find(skey);
+  bool opened = false;
   if (it == m_switchFlows.end()) {
     if (received == 0) return;
     it = m_switchFlows.emplace(skey, SwitchFlowStat{port, port, t, t, 0, 0, 0, 0, 0, 0, pg, false, false, false}).first;
+    opened = true;
+  }
+  // Counters land BEFORE any snapshot (same law as the send side).
+  it->second.last_ns = t;
+  it->second.in_bytes = received; // a terminal has no interior: what arrived has ENTERED it too
+  it->second.bytes = wire;
+  it->second.out_bytes = received;
+  it->second.out_wire = wire;     // out-side wire, the NIC's physical total off the wire
+  if (opened) {
     std::cout << "EVENT flow_eject t_ns=" << t << " switch=" << node_id << " egress_port=" << port
               << " pg=" << (uint32_t)pg;
     if (size) std::cout << " size_bytes=" << size;
@@ -339,8 +358,6 @@ void EventLogger::OnHostRecv(uint32_t node_id, uint32_t port, uint8_t pg, uint32
               << "->" << Ipv4Address(dip) << ":" << dport << std::endl;
     DumpFlowCut(t);
   }
-  it->second.last_ns = t;
-  it->second.out_bytes = received;
   if (size && received >= size) {
     EmitSwitchLeave(node_id, port, size, sip, dip, sport, dport, t, wire, received, false);
     m_switchFlows.erase(it);
@@ -677,9 +694,11 @@ void EventLogger::DumpFlowCut(int64_t t_ns) {
     std::cout << " flow=" << Ipv4Address(k.src_ip) << ":" << k.sport
               << "->" << Ipv4Address(k.dst_ip) << ":" << k.dport
               << " ingress_port=" << s.in_port
-              << " in_bytes=" << s.in_bytes
+              << " in_payload=" << s.in_bytes
+              << " in_wire=" << s.bytes
               << " egress_port=" << s.out_port
-              << " out_bytes=" << s.out_bytes;
+              << " out_payload=" << s.out_bytes
+              << " out_wire=" << s.out_wire;
     // The CC plane's stamped counters (data: CE-carrying payload; cc: CNP-flagged wire bytes) --
     // only under NS3_CC_EVENTS, so a cut-probe-only trace stays byte-identical.
     if (m_ccEvents) std::cout << " in_marked=" << s.in_marked << " out_marked=" << s.out_marked;
