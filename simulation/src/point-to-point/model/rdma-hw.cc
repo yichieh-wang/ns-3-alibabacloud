@@ -440,7 +440,7 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
 	EventLogger::Get().OnHostRecv(m_node->GetId(), m_nic[GetNicIdxOfRxQp(rxQp)].dev->GetIfIndex(),
 	                              (uint8_t)ch.udp.pg, ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
-	                              rxQp->ReceiverNextExpectedSeq); // host-quadrant: host_recv/_done
+	                              rxQp->ReceiverNextExpectedSeq, p->GetSize()); // host-quadrant: host_recv/_done; GetSize = wire (headers still on)
 	if (x == 1 || x == 2){ //generate ACK or NACK
 		qbbHeader seqh;
 		seqh.SetSeq(rxQp->ReceiverNextExpectedSeq);
@@ -740,7 +740,7 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 
 	// update state
 	qp->snd_nxt += payload_size;
-	EventLogger::Get().OnHostSend(m_node->GetId(), m_nic[GetNicIdxOfQp(qp)].dev->GetIfIndex(), qp); // host-quadrant: derives host_send/_done from snd_nxt
+	EventLogger::Get().OnHostSend(m_node->GetId(), m_nic[GetNicIdxOfQp(qp)].dev->GetIfIndex(), qp, p->GetSize()); // host-quadrant: derives host_send/_done from snd_nxt; GetSize = wire (fully headed)
 	// std::cout << "current snd_nxt is: " << qp->snd_nxt << ", the window is: " << qp->m_win << std::endl;
 	qp->m_ipid++;
 

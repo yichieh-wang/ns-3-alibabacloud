@@ -52,14 +52,14 @@ public:
   // Host-side quadrant (the NIC cuts, one link outside the switch cuts): first/last payload byte OUT
   // of the sender (host_send / host_send_done) and IN at the receiver (host_recv / host_recv_done).
   // Called per packet; the logger derives the four endpoint events from the cumulative counters.
-  void OnHostSend(uint32_t node_id, uint32_t port, Ptr<RdmaQueuePair> qp);
+  void OnHostSend(uint32_t node_id, uint32_t port, Ptr<RdmaQueuePair> qp, uint32_t wire_bytes);
   // HOST-CC quadrant (NS3_HOST_PORT_EVENTS + NS3_CC_EVENTS), NoC convention as for payload:
   // the dst terminal SENDING its reverse leg (ACK/NACK/CNP) is INJECTING it into the network;
   // the src terminal RECEIVING it is EJECTING it out. Flow spelled as the DATA tuple, kind=cc.
   void OnHostCcSend(uint32_t node_id, uint32_t port, uint32_t data_sip, uint32_t data_dip, uint16_t data_sport, uint16_t data_dport, uint8_t pg, uint32_t wire_bytes, bool cnp, uint64_t data_received);
   void OnHostCcRecv(uint32_t node_id, uint32_t port, uint32_t data_sip, uint32_t data_dip, uint16_t data_sport, uint16_t data_dport, uint8_t pg, uint32_t wire_bytes, bool cnp, bool finished);
   void OnHostRecv(uint32_t node_id, uint32_t port, uint8_t pg, uint32_t sip, uint32_t dip, uint16_t sport,
-                  uint16_t dport, uint64_t received);
+                  uint16_t dport, uint64_t received, uint32_t wire_bytes);
   void OnQpComplete(Ptr<RdmaQueuePair> qp);
 
   // SWITCH-SIDE hook (design point (d)): called from SwitchNode::SendToDev once a
@@ -90,9 +90,10 @@ public:
   // dequeued from the BEgressQueue and handed to TransmitStart -- i.e. it TRULY LEAVES this switch
   // on the wire (the routed-vs-actually-transmitted distinction: OnSwitchForward counts bytes that
   // ENTERED + were routed; this counts bytes that DEPARTED). Adds the packet's PAYLOAD to the
-  // matching (switch, 5-tuple) OPEN segment's cut_out counter (flow_cut's out_bytes=). No-op if the
+  // matching (switch, 5-tuple) OPEN segment's cut_out counter (flow_cut's out_bytes=) and its
+  // WIRE size to out_wire (flow_eject_done's wire_bytes=). No-op if the
   // segment is already closed (nothing open to attribute to). Observe-only; off => no-op.
-  void OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64_t payload,
+  void OnSwitchTransmit(uint32_t switch_id, uint32_t out_port, uint64_t payload, uint64_t wire,
                         uint32_t src_ip, uint32_t dst_ip, uint16_t sport, uint16_t dport,
                         bool cc, bool marked);
 
@@ -216,9 +217,11 @@ private:
   //   in_port   = ingress NetDevice the segment arrived on (-> flow_cut ingress_port=; the
   //               same value switch_enter prints as ingress_port=)
   //   out_port  = egress the segment uses now              (-> flow_cut egress_port=)
-  //   bytes     = ON-WIRE bytes routed here (feeds switch_leave bytes=; kept as-is)
+  //   bytes     = ON-WIRE bytes routed here (forward-side; diagnostic -- the emitted
+  //               wire_bytes= reads out_wire, what truly left)
   //   in_bytes  = PAYLOAD bytes routed here     (cut_in  -> flow_cut in_bytes=)
   //   out_bytes = PAYLOAD bytes transmitted out (cut_out -> flow_cut out_bytes=)
+  //   out_wire  = ON-WIRE bytes transmitted out (-> flow_eject_done wire_bytes=)
   struct SwitchFlowStat {
     uint32_t out_port;
     uint32_t in_port;
@@ -227,6 +230,7 @@ private:
     uint64_t bytes;
     uint64_t in_bytes;
     uint64_t out_bytes;
+    uint64_t out_wire;
     uint64_t in_marked;  // stamped units in  (data: CE-carrying payload bytes; cc: CNP-flagged wire bytes)
     uint64_t out_marked; // stamped units out -- the stamp is STICKY (set upstream, carried to the wire),
                          // so any port's counter includes upstream stamps: cut-composable like in/out_bytes
@@ -262,6 +266,11 @@ private:
   // erased with m_flowPayload at qp_complete.
   std::map<FlowSizeKey, uint8_t> m_hostSendMark;
   std::map<FlowSizeKey, uint8_t> m_hostRecvMark;
+  // Physical wire bytes through the host NIC per flow (headers ride; a retransmit and a
+  // duplicate arrival re-count -- the PHYSICAL injection/extraction totals the host-quadrant
+  // done lines speak). Erased with the marks at qp_complete.
+  std::map<FlowSizeKey, uint64_t> m_hostSendWire;
+  std::map<FlowSizeKey, uint64_t> m_hostRecvWire;
 };
 
 } // namespace ns3

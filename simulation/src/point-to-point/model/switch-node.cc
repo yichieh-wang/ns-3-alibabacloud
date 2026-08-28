@@ -255,11 +255,11 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 		chOut.getInt = 1;
 		p->PeekHeader(chOut);
 		if (chOut.l3Prot == 0x11)
-			EventLogger::Get().OnSwitchTransmit(GetId(), ifIndex, p->GetSize() - chOut.GetSerializedSize(),
+			EventLogger::Get().OnSwitchTransmit(GetId(), ifIndex, p->GetSize() - chOut.GetSerializedSize(), p->GetSize(),
 			                                    chOut.sip, chOut.dip, chOut.udp.sport, chOut.udp.dport,
 			                                    false, chOut.GetIpv4EcnBits() == 0x03);
 		else if ((chOut.l3Prot == 0xFC || chOut.l3Prot == 0xFD) && EventLogger::Get().CcEventsEnabled())
-			EventLogger::Get().OnSwitchTransmit(GetId(), ifIndex, p->GetSize(),
+			EventLogger::Get().OnSwitchTransmit(GetId(), ifIndex, p->GetSize(), p->GetSize(),
 			                                    chOut.dip, chOut.sip, chOut.ack.dport, chOut.ack.sport,
 			                                    true, ((chOut.ack.flags >> qbbHeader::FLAG_CNP) & 1) != 0);
 	}
