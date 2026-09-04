@@ -113,9 +113,10 @@ void EmitMarkOnset(const char* side, int64_t t, uint32_t sw, const char* port_ke
             << "->" << Ipv4Address(dip) << ":" << dport
             << std::endl;
 }
-// The cca string for an RdmaHw CcMode (the config's cca<->CcMode mapping, DCQCN == 1).
+// The cca string for an RdmaHw CcMode (the config's cca<->CcMode mapping: dcqcn == 1,
+// fixed_rate == 0 — no CC handler, PFC alone).
 const char* CcaName(uint32_t ccMode) {
-  return ccMode == 1 ? "dcqcn" : "unknown";
+  return ccMode == 1 ? "dcqcn" : ccMode == 0 ? "fixed_rate" : "unknown";
 }
 } // namespace
 
